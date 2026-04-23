@@ -1,6 +1,4 @@
 import { ref, computed, type ComputedRef } from 'vue'
-import { useRouter } from 'vue-router'
-import useSound from '@/use/useSound.ts'
 
 const debugSaved = localStorage.getItem('debug') || 'false'
 export const isDebug = ref(!!JSON.parse(debugSaved))

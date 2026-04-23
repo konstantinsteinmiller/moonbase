@@ -211,7 +211,7 @@ const advanceLine = () => {
  *  feature opt-in per choice: add a matching VO file and the line plays,
  *  otherwise the existing behaviour is preserved. Returns a promise that
  *  resolves either when audio ends or on a safety timeout. */
-const playChoiceVoice = (lineId: string, choiceId: string, fallbackMs = 3200): Promise<boolean> =>
+const playChoiceVoice = (lineId: string, choiceId: string, fallbackMs = 1200): Promise<boolean> =>
   new Promise(resolve => {
     const { userSoundVolume } = useUser()
     const fullSrc = prependBaseUrl(`audio/voice/${lineId}_${choiceId}.ogg`)

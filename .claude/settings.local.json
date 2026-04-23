@@ -103,7 +103,11 @@
       "Bash(HEADED=1 node tests/e2e/traversal.mjs crater-escape)",
       "Bash(HEADED=1 node tests/e2e/traversal.mjs all)",
       "Bash(kill %1)",
-      "Bash(pkill -f \"vite\")"
+      "Bash(pkill -f \"vite\")",
+      "Read(//tmp/claude/C--Users-konst-Documents---p-moonbase/03f67253-198d-4ca0-8fa0-3de6bacf6e5c/tasks/**)",
+      "Bash(git branch *)",
+      "Bash(git stash *)",
+      "Bash(git push *)"
     ]
   }
 }

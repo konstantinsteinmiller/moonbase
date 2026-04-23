@@ -1293,6 +1293,196 @@ onMounted(async () => {
       },
       forceEndDialog: () => {
         try { skipDialog() } catch { /* ignore */ }
+      },
+
+      // -- Mission + dialog inspection ------------------------------------
+      get phase() {
+        return phase.value
+      },
+      get objective() {
+        return MISSION_OBJECTIVES[phase.value]
+      },
+      get missionBanner() {
+        // Snake-cased to match the useMission export; read-only string | null.
+        const m = (useMission as any)
+        void m
+        return (document.querySelector('.mission-hud .banner')?.textContent ?? null) as string | null
+      },
+      get inventory() {
+        return {
+          ore: ore.value, metal: metal.value, parts: parts.value,
+          fuel: fuel.value, energy: energy.value,
+          solarBroken: isSolarCellBroken.value,
+          commsBroken: isCommsBroken.value
+        }
+      },
+      get isDialogOpen() {
+        return isDialogOpen.value
+      },
+      get isAwaitingChoice() {
+        return isAwaitingChoice.value
+      },
+      get currentLineId() {
+        return currentDialogLine.value?.id ?? null
+      },
+      get currentLineSpeaker() {
+        return currentDialogLine.value?.speaker ?? null
+      },
+      get currentLineText() {
+        return currentDialogLine.value?.text ?? null
+      },
+      get currentChoices() {
+        return currentDialogLine.value?.choices?.map(c => c.id) ?? null
+      },
+      /** World-space target the yellow objective marker currently points at.
+       *  Returns { x, z, hasTarget } — `hasTarget=false` means targetForPhase
+       *  returned null (e.g. during mission_complete). */
+      get markerTarget() {
+        const t = targetForPhase(phase.value)
+        return t ? { x: t.x, z: t.z, hasTarget: true } : { x: 0, z: 0, hasTarget: false }
+      },
+      /** Screen-projected marker payload (same object MissionHUD renders).
+       *  Tests check `visible` to assert the yellow circle is on-screen. */
+      get markerScreen() {
+        const m = markerScreen.value
+        return m ? { ...m } : null
+      },
+      get salvagedCount() {
+        return salvagedCount.value
+      },
+      /** Array snapshot of the salvaged set — diagnostic for tests. */
+      get salvaged() {
+        return snapshotSalvaged()
+      },
+      get isCinematic() {
+        return cinematic.active
+      },
+      get isGameOver() {
+        return gameOverOpen.value
+      },
+
+      // -- Dialog progression --------------------------------------------
+      /** Advance the current dialog by one line (what pressing SPACE does).
+       *  No-op on a choice prompt — use `pickChoice` instead. */
+      advanceDialog: () => {
+        try {
+          advanceLine()
+        } catch { /* ignore */
+        }
+      },
+      /** Pick a choice on the current line by id (e.g. 'silent', 'sass'). */
+      pickChoice: (id: string) => {
+        try {
+          pickDialogChoice(id)
+        } catch { /* ignore */
+        }
+      },
+      /** Drain the entire active dialog chain as fast as the engine will
+       *  let us. Picks `preferredChoices[lineId]` at choice nodes, or the
+       *  first option if the map has no entry. Returns after the chain
+       *  fully closes (isDialogOpen goes false) or the safety cap fires.
+       *
+       *  `pickChoice` is inherently asynchronous (the engine plays an
+       *  optional choice-voice clip before advancing), so we only call it
+       *  ONCE per choice-line id and then wait for `isAwaitingChoice` to
+       *  flip false on its own. Re-invoking would bump the internal runId
+       *  and cancel the in-flight advance, stalling the test indefinitely. */
+      drainDialog: async (preferredChoices: Record<string, string> = {}, maxIters = 800) => {
+        let iters = 0
+        let pickedFor: string | null = null
+        while (isDialogOpen.value && iters++ < maxIters) {
+          if (isAwaitingChoice.value) {
+            const line = currentDialogLine.value
+            const key = line?.id ?? ''
+            if (key !== pickedFor) {
+              const choices = line?.choices ?? []
+              const picked = preferredChoices[key] ?? choices[0]?.id
+              if (picked) {
+                pickDialogChoice(picked)
+                pickedFor = key
+              }
+            }
+            // else: still on the same choice line — wait for the async
+            // choice-voice continuation to fire advanceAfterChoice.
+          } else {
+            pickedFor = null
+            advanceLine()
+          }
+          await new Promise(r => setTimeout(r, 60))
+        }
+      },
+      /** Skip the 1.5 s post-dialog grace period for the next startDialog.
+       *  Not ideal in prod but essential for deterministic tests. */
+      startDialogDirect: (id: string) => {
+        try {
+          startDialogDirect(id, true)
+        } catch { /* ignore */
+        }
+      },
+
+      // -- Mission gameplay shortcuts ------------------------------------
+      /** Destroy the live quarry stone closest to the player. Grants 1 ore
+       *  and fires the same destruction path the flamethrower would. */
+      cutNearestStone: () => {
+        if (!player) return false
+        let best: typeof stones[number] | null = null
+        let bestD = Infinity
+        for (const s of stones) {
+          if (!s.alive) continue
+          const d = player.position.distanceTo(s.worldPos)
+          if (d < bestD) {
+            bestD = d
+            best = s
+          }
+        }
+        if (!best) return false
+        destroyStone(best)
+        return true
+      },
+      /** One-shot smelt: consume all remaining ore, add an equal number of
+       *  metal ingots, and advance the phase to `complete` so the
+       *  mission_complete → explorer_briefing chain can fire. Mirrors the
+       *  CraftingMenu loop without the UI. */
+      smeltAllOre: () => {
+        let smelted = 0
+        while (ore.value > 0) {
+          consumeOre(1)
+          addMetal(1)
+          smelted++
+        }
+        if (phase.value === 'craft' || phase.value === 'quarry_done') {
+          setPhase('complete')
+          startDialogDirect('mission_complete', true)
+        }
+        return smelted
+      },
+      /** Mirror the E-key salvage interaction without requiring a precise
+       *  position — mark the chassis salvaged, grant +1 parts, fire the
+       *  forensic monologue. `kind` matches the BrokenEwallKind union
+       *  ('valley' | 'rift' | 'quarry'). */
+      doSalvage: (kind: 'valley' | 'rift' | 'quarry') => {
+        markSalvaged(kind)
+        addParts(1)
+        const script =
+          kind === 'valley' ? 'mission_salvage_valley' :
+            kind === 'rift' ? 'mission_salvage_rift' :
+              'mission_salvage_quarry'
+        startDialogDirect(script, true)
+      },
+
+      /** Run the same effect the Crafting Menu's "Repair Solar Cell"
+       *  button produces: consume 1 metal + 2 salvage if available, flip
+       *  the inventory flag, and start the Ewall-9 arc. Used by the test
+       *  after the three broken Ewalls have been salvaged. */
+      doRepairSolar: () => {
+        const inv = useInventory()
+        if (metal.value >= 1 && parts.value >= 2) {
+          inv.consumeMetal(1)
+          inv.consumeParts(2)
+        }
+        inv.repairSolarCell()
+        setPhaseUnsafe('ewall9_meeting')
+        startDialogDirect('mission_solar_repaired', true)
       }
     }
   }
