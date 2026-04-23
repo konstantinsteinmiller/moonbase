@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Chaos Arena",
+  "productName": "Project: Moonbase",
   "version": "1.0.1",
-  "identifier": "com.chaos.arena",
+  "identifier": "com.moonbase.project",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Chaos Arena",
+        "title": "Project: Moonbase",
         "width": 414,
         "height": 896,
         "resizable": true,

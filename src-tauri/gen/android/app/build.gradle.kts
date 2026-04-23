@@ -22,10 +22,10 @@ val keystoreProperties = Properties().apply {
 
 android {
     compileSdk = 36
-    namespace = "com.chaos.arena"
+    namespace = "com.moonbase.project"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.chaos.arena"
+        applicationId = "com.moonbase.project"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -73,7 +73,24 @@ android {
     applicationVariants.all {
         outputs.all {
             (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName =
-                "chaos-arena-${defaultConfig.versionName}.apk"
+                "com.moonbase.project.apk"
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.matching { it.name.startsWith("bundle") && it.name.endsWith("Release") }.configureEach {
+        doLast {
+            val bundleRoot = layout.buildDirectory.dir("outputs/bundle").get().asFile
+            bundleRoot.listFiles()?.filter { it.isDirectory }?.forEach { variantDir ->
+                variantDir.listFiles { _, name -> name.endsWith(".aab") }?.forEach { aab ->
+                    val target = java.io.File(aab.parentFile, "com.moonbase.project.aab")
+                    if (aab.name != target.name) {
+                        if (target.exists()) target.delete()
+                        aab.renameTo(target)
+                    }
+                }
+            }
         }
     }
 }

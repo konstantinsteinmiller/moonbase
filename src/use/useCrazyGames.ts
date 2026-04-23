@@ -8,27 +8,27 @@
 //      ('crazygames' for live iframe, 'local' for local dev tooling) AND the
 //      build-time `isCrazyWeb` flag is set (VITE_APP_CRAZY_WEB=true).
 //
-//   2. Data persistence mirror — when the SDK is active, every subsequent
-//      `localStorage.setItem` / `removeItem` is also forwarded to the SDK's
-//      data module so progress follows the player across devices. All existing
-//      synchronous `localStorage.getItem` reads in the app keep working
-//      because we hydrate the browser's localStorage from the SDK *before*
-//      the main Vue app module graph loads (see main.ts).
-//
-//   3. Gameplay lifecycle — `startGameplay()` / `stopGameplay()` wrap the
+//   2. Gameplay lifecycle — `startGameplay()` / `stopGameplay()` wrap the
 //      SDK's `game.gameplayStart()` / `gameplayStop()` hooks, which let
 //      CrazyGames know when the player is actually in a match (vs menus).
 //
-//   4. `showRewardedAd()` — a Promise-based wrapper around the SDK's
+//   3. `showRewardedAd()` — a Promise-based wrapper around the SDK's
 //      `ad.requestAd('rewarded', …)` callback API. Resolves `true` only when
 //      the video played all the way through, so callers can safely grant the
 //      reward on success and be silent on failure.
 //
+// Persistence of player progress is handled separately by
+// `@/utils/save/CrazyGamesStrategy`, wired into `SaveManager` at boot. This
+// module exposes `createCrazyGamesSaveStrategy()` so the bootstrap can pick
+// that strategy without reaching into SDK internals itself.
+//
 // Outside of a CrazyGames build the module is inert: `isSdkActive` stays
-// false, localStorage is untouched, and `showRewardedAd()` resolves false.
+// false and `showRewardedAd()` resolves false.
 
 import { ref } from 'vue'
 import { isCrazyWeb } from '@/use/useUser'
+import { CrazyGamesStrategy } from '@/utils/save/CrazyGamesStrategy'
+import type { SaveStrategy } from '@/utils/save/types'
 
 // The CrazyGames SDK is loaded globally via a script tag in index.html.
 // We interact with it entirely through `window.CrazyGames.SDK`, so the
@@ -73,67 +73,6 @@ let sdk: any = null
 let initialized = false
 let gameplayActive = false
 
-// Manifest key used to track which keys have been written through
-// `localStorage.setItem` while the SDK was active. We need it because the
-// SDK's data module doesn't expose a "list all keys" API — so on the next
-// session we hydrate by iterating this manifest.
-const KEYS_MANIFEST = '__ca_keys__'
-
-// Raw localStorage bindings captured before we replace the public ones.
-// Used by the mirror to actually write to the browser without recursing
-// into our own wrappers.
-let rawSetItem: (key: string, value: string) => void = window.localStorage.setItem.bind(window.localStorage)
-let rawRemoveItem: (key: string) => void = window.localStorage.removeItem.bind(window.localStorage)
-let lsPatched = false
-
-// Re-entrancy guard: when true, localStorage writes come from the SDK
-// itself (caching cloud data) and must not be mirrored back.
-let mirroring = false
-
-// Keys the SDK writes internally — never mirror these back to sdk.data.
-const isInternalKey = (key: string): boolean =>
-  key === KEYS_MANIFEST ||
-  key.startsWith('__SafeLocalStorage__') ||
-  key.startsWith('SDK_DATA_')
-
-// Debounce: collect dirty keys and flush them to sdk.data in one batch
-// so rapid game-state writes don't each trigger a separate cloud round-trip.
-let dirtyKeys = new Map<string, string | null>()
-let flushTimer: ReturnType<typeof setTimeout> | null = null
-const FLUSH_DELAY_MS = 500
-
-const scheduleFlush = () => {
-  if (flushTimer !== null) return
-  flushTimer = setTimeout(flushToSdk, FLUSH_DELAY_MS)
-}
-
-const flushToSdk = () => {
-  flushTimer = null
-  if (!sdk) return
-  const batch = dirtyKeys
-  dirtyKeys = new Map()
-  mirroring = true
-  for (const [key, value] of batch) {
-    try {
-      if (value !== null) {
-        sdk.data?.setItem?.(key, value)
-      } else {
-        sdk.data?.removeItem?.(key)
-      }
-    } catch (e) {
-      console.warn(`[crazygames] sdk.data sync ("${key}") failed`, e)
-    }
-  }
-  // Sync the manifest so the next session can hydrate all keys
-  try {
-    const manifest = readManifest()
-    sdk.data?.setItem?.(KEYS_MANIFEST, JSON.stringify(manifest))
-  } catch (e) {
-    console.warn('[crazygames] manifest sync failed', e)
-  }
-  mirroring = false
-}
-
 const getSdk = (): any => (typeof window !== 'undefined' ? window.CrazyGames?.SDK ?? null : null)
 
 const isActiveEnv = (s: any): boolean => {
@@ -148,11 +87,10 @@ const isActiveEnv = (s: any): boolean => {
 // ─── Init ──────────────────────────────────────────────────────────────────
 
 /**
- * Initialize the SDK. Must be awaited *before* the main Vue app module
- * graph loads so that hydrated data lands in localStorage before any
- * module-level `localStorage.getItem(...)` call runs.
- *
- * Safe to call multiple times — subsequent calls are no-ops.
+ * Initialize the SDK. Safe to call multiple times — subsequent calls are
+ * no-ops. Persistence hydration happens separately via
+ * `CrazyGamesStrategy` wired into `SaveManager` — this function now only
+ * handles SDK init, profile capture, and mute listeners.
  */
 export const initCrazyGames = async (): Promise<void> => {
   if (initialized) return
@@ -173,20 +111,31 @@ export const initCrazyGames = async (): Promise<void> => {
 
   if (!isActiveEnv(candidate)) {
     // Non-crazy-web build, or running in a 'disabled' environment.
-    // Leave localStorage alone and keep `isSdkActive` false.
-    // sdk = candidate
-    // isSdkActive.value = true
     return
   }
 
   sdk = candidate
   isSdkActive.value = true
 
-  await hydrateFromSdk()
-  patchLocalStorage()
   await captureSdkProfile()
   registerMuteListener()
 }
+
+/**
+ * Build the save strategy backed by the CrazyGames `data` module. The
+ * strategy pulls the SDK lazily through `getSdk()` so it can be
+ * constructed before `initCrazyGames()` has resolved — actual data calls
+ * happen during `hydrate()` which `SaveManager` awaits after SDK init.
+ *
+ * Returns a strategy that no-ops when the SDK isn't available, so the
+ * game never blocks on a missing script tag.
+ */
+export const createCrazyGamesSaveStrategy = (): SaveStrategy =>
+  new CrazyGamesStrategy(() => {
+    const data = sdk?.data
+    if (!data || typeof data.getItem !== 'function') return null
+    return data
+  })
 
 // ─── Profile / settings capture ───────────────────────────────────────────
 
@@ -243,91 +192,6 @@ const captureSdkProfile = async (): Promise<void> => {
   } catch (e) {
     console.warn('[crazygames] systemInfo locale read failed', e)
   }
-}
-
-// ─── Hydration (SDK → localStorage) ───────────────────────────────────────
-
-const hydrateFromSdk = async (): Promise<void> => {
-  if (!sdk?.data) return
-  mirroring = true
-  try {
-    const manifestRaw = await sdk.data.getItem(KEYS_MANIFEST)
-    const keys: string[] = manifestRaw ? safeParseArray(manifestRaw) : []
-    for (const key of keys) {
-      try {
-        const value = await sdk.data.getItem(key)
-        if (value !== null && value !== undefined) {
-          rawSetItem(key, String(value))
-        }
-      } catch (e) {
-        console.warn(`[crazygames] hydrate getItem("${key}") failed`, e)
-      }
-    }
-  } catch (e) {
-    console.warn('[crazygames] hydrate manifest failed', e)
-  }
-  mirroring = false
-}
-
-const safeParseArray = (raw: string): string[] => {
-  try {
-    const v = JSON.parse(raw)
-    return Array.isArray(v) ? v.filter((k): k is string => typeof k === 'string') : []
-  } catch {
-    return []
-  }
-}
-
-// ─── Mirror (localStorage → SDK) ──────────────────────────────────────────
-
-const patchLocalStorage = (): void => {
-  if (lsPatched) return
-  lsPatched = true
-
-  const ls = window.localStorage
-  // Rebind now in case something else replaced these between module load
-  // and init() resolving.
-  rawSetItem = ls.setItem.bind(ls)
-  rawRemoveItem = ls.removeItem.bind(ls)
-
-  ls.setItem = (key: string, value: string) => {
-    rawSetItem(key, value)
-    if (mirroring || isInternalKey(key)) return
-    dirtyKeys.set(key, value)
-    trackKey(key)
-    scheduleFlush()
-  }
-
-  ls.removeItem = (key: string) => {
-    rawRemoveItem(key)
-    if (mirroring || isInternalKey(key)) return
-    dirtyKeys.set(key, null)
-    untrackKey(key)
-    scheduleFlush()
-  }
-}
-
-const readManifest = (): string[] => {
-  const raw = window.localStorage.getItem(KEYS_MANIFEST)
-  return raw ? safeParseArray(raw) : []
-}
-
-const writeManifest = (keys: string[]): void => {
-  rawSetItem(KEYS_MANIFEST, JSON.stringify(keys))
-}
-
-const trackKey = (key: string): void => {
-  const keys = readManifest()
-  if (!keys.includes(key)) {
-    keys.push(key)
-    writeManifest(keys)
-  }
-}
-
-const untrackKey = (key: string): void => {
-  const keys = readManifest()
-  const next = keys.filter(k => k !== key)
-  if (next.length !== keys.length) writeManifest(next)
 }
 
 // ─── Gameplay lifecycle ───────────────────────────────────────────────────
@@ -572,6 +436,7 @@ const useCrazyGames = () => ({
   crazyPlayerName,
   crazyLocale,
   initCrazyGames,
+  createCrazyGamesSaveStrategy,
   startGameplay,
   stopGameplay,
   showRewardedAd,

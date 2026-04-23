@@ -69,7 +69,7 @@ export default defineConfig(({ mode, command }) => {
   ]
   // Extra per-directive sources that don't follow the blanket host pattern.
   const CSP_EXTRA: Record<string, string[]> = {
-    'script-src': [],
+    'script-src': ['\'wasm-unsafe-eval\''],
     'style-src': ['\'unsafe-inline\''],
     'img-src': ['data:'],
     'connect-src': [

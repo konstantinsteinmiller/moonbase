@@ -1,97 +1,38 @@
 import { ref } from 'vue'
-import { modelImgPath, SPINNER_MODEL_IDS, getSelectedSkin } from '@/use/useModels.ts'
-import useSpinnerConfig from '@/use/useSpinnerConfig.ts'
-import useSpinnerCampaign from '@/use/useSpinnerCampaign.ts'
-import { prependBaseUrl } from '@/utils/function.ts'
-import type { TopPartId } from '@/types/spinner'
+import { prependBaseUrl } from '@/utils/function'
 
-// Shared state so it can be accessed by both the loader and the progress component
 const loadingProgress = ref(0)
 const areAllAssetsLoaded = ref(false)
 
-// THIS IS THE KEY: A persistent memory reference
 export const resourceCache = {
   images: new Map<string, HTMLImageElement>(),
-  audio: new Map<string, HTMLAudioElement>()
+  audio: new Map<string, HTMLAudioElement>(),
+  videos: new Map<string, HTMLVideoElement>()
 }
 
-const STATIC_IMAGES = [
-  'images/logo/logo_256x256.webp',
-  'images/icons/difficulty-icon_128x128.webp',
-  'images/icons/settings-icon_128x128.webp',
-  'images/icons/sound-icon_128x128.webp',
-  'images/icons/team_128x128.webp',
-  'images/icons/gears_128x128.webp',
-  'images/icons/movie_128x96.webp',
-  'images/icons/chest_128x128.webp',
-  'images/icons/trophy_128x128.webp',
-  'images/bg/parchment-ribbon_553x188.webp',
-  'images/vfx/big-spark_1280x256.webp',
-  'images/vfx/dark-smoke_1280x128.webp',
-  'images/vfx/earth-rip-decal_138x138.webp'
+// Only a small set of critical assets are preloaded before the game boots.
+// The world geometry is procedural, so there are no 3D model downloads to
+// wait for. Voice-over lines are loaded on-demand by the dialog system.
+const STATIC_IMAGES: string[] = [
+  'images/logo/logo_256x256.webp'
 ]
 
-const SOUND_ASSETS = [
-  'audio/sfx/clash-1.ogg',
-  'audio/sfx/clash-2.ogg',
-  'audio/sfx/clash-3.ogg',
-  'audio/sfx/clash-4.ogg',
-  'audio/sfx/clash-5.ogg',
-  'audio/sfx/celebration-1.ogg',
-  'audio/sfx/celebration-2.ogg',
-  'audio/sfx/happy.ogg',
-  'audio/sfx/level-up.ogg',
-  'audio/sfx/win.ogg',
-  'audio/sfx/lose.ogg',
-  'audio/sfx/reward-continue.ogg'
+const SOUND_ASSETS: string[] = [
+  // Meteor shower cue bank — the shower cinematic needs zero-latency
+  // playback when it triggers (the flyby plays the instant the event
+  // fires; the four impact clips ricochet randomly as small rocks hit).
+  'audio/sfx/meteor-flyby.ogg',
+  'audio/sfx/meteor-impact-1.ogg',
+  'audio/sfx/meteor-impact-2.ogg',
+  'audio/sfx/meteor-impact-3.ogg',
+  'audio/sfx/meteor-impact-4.ogg'
 ]
 
-// Kept for reference — music is streamed on demand from SpinnerArena, not preloaded.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const MUSIC_ASSETS = [
-  'audio/music/battle-1.ogg',
-  'audio/music/battle-2.ogg',
-  'audio/music/battle-3.ogg',
+// Non-critical videos — fetched after the main preload finishes, during an
+// idle tick, so the loading screen never waits on them.
+const IDLE_VIDEO_ASSETS: string[] = [
+  'video/ekon-tusk-no-voice.mp4'
 ]
-
-/**
- * Skin IDs the player will see IMMEDIATELY on first paint:
- *   • both player-team slots (resolved via getSelectedSkin — falls back to the
- *     default catalog skin when no selection has been persisted yet, which
- *     covers the very first load).
- *   • every enemy in the current campaign stage (stored on each StageBladeConfig).
- *
- * Everything else (the other ~40 skins in the config modal catalog, future
- * stages the player hasn't unlocked yet) is deferred to `preloadRemainingSkins`
- * which runs in the background once the arena is interactive.
- */
-const getCriticalSkinIds = (): Set<string> => {
-  const ids = new Set<string>()
-  try {
-    const { playerTeam } = useSpinnerConfig()
-    playerTeam.value.forEach((cfg, slotIndex) => {
-      // modelId override wins; otherwise resolve the player's chosen skin for
-      // this top part. getSelectedSkin always returns a valid id (default on
-      // first load).
-      const id = cfg.modelId ?? getSelectedSkin(cfg.topPartId as TopPartId, slotIndex)
-      if (id) ids.add(id)
-    })
-  } catch (e) {
-    console.warn('[assets] player team resolve failed, using no player skins', e)
-  }
-  try {
-    const { currentStage } = useSpinnerCampaign()
-    const stage = currentStage.value
-    if (stage?.enemyTeam) {
-      for (const enemy of stage.enemyTeam) {
-        if (enemy.modelId) ids.add(enemy.modelId)
-      }
-    }
-  } catch (e) {
-    console.warn('[assets] stage resolve failed, using no stage skins', e)
-  }
-  return ids
-}
 
 type AssetEntry = { src: string; type: 'image' | 'audio' }
 
@@ -116,7 +57,6 @@ const loadAsset = (
         resolve(img)
       }
       img.onerror = () => {
-        console.error('Preload fail:', src)
         onLoaded?.()
         resolve(null)
       }
@@ -138,6 +78,35 @@ const loadAsset = (
   })
 }
 
+const preloadVideo = (src: string): Promise<void> =>
+  new Promise(resolve => {
+    if (resourceCache.videos.has(src)) {
+      resolve()
+      return
+    }
+    const video = document.createElement('video')
+    video.preload = 'auto'
+    video.muted = true
+    video.playsInline = true
+    video.crossOrigin = 'anonymous'
+    const done = () => {
+      resourceCache.videos.set(src, video)
+      resolve()
+    }
+    video.addEventListener('canplaythrough', done, { once: true })
+    video.addEventListener('error', () => resolve(), { once: true })
+    video.src = src
+    video.load()
+  })
+
+const scheduleIdle = (cb: () => void) => {
+  const ric = (window as any).requestIdleCallback as
+    | ((cb: () => void, opts?: { timeout: number }) => number)
+    | undefined
+  if (ric) ric(() => cb(), { timeout: 3000 })
+  else setTimeout(cb, 500)
+}
+
 const runInChunks = async (assets: AssetEntry[], chunkSize: number, onLoaded?: () => void) => {
   for (let i = 0; i < assets.length; i += chunkSize) {
     const chunk = assets.slice(i, i + chunkSize)
@@ -145,73 +114,50 @@ const runInChunks = async (assets: AssetEntry[], chunkSize: number, onLoaded?: (
   }
 }
 
-// Tracks in-flight background skin preload so repeat triggers noop and the
-// config modal can await it if opened early.
-let remainingSkinsPromise: Promise<void> | null = null
-
 export default () => {
   const preloadAssets = async () => {
     if (areAllAssetsLoaded.value) return
-
-    const criticalSkinIds = getCriticalSkinIds()
-    const criticalSkinPaths = [...criticalSkinIds].map(id => modelImgPath(id))
-
     const allAssets: AssetEntry[] = [
       ...STATIC_IMAGES.map(src => ({ src: prependBaseUrl(src), type: 'image' as const })),
-      ...criticalSkinPaths.map(src => ({ src, type: 'image' as const })),
       ...SOUND_ASSETS.map(src => ({ src: prependBaseUrl(src), type: 'audio' as const }))
     ]
-
+    const totalCount = Math.max(1, allAssets.length)
     let loadedCount = 0
-    const totalCount = allAssets.length
     const onOne = () => {
       loadedCount++
       loadingProgress.value = Math.floor((loadedCount / totalCount) * 100)
     }
-
     try {
       await runInChunks(allAssets, 10, onOne)
+    } catch (e) {
+      console.error('Preload failed:', e)
+    } finally {
       areAllAssetsLoaded.value = true
       loadingProgress.value = 100
-    } catch (error) {
-      console.error('Preload failed:', error)
-      loadingProgress.value = 100
+      // Kick off non-critical video preloads once the main bar finishes and
+      // the main thread is idle — keeps them out of the boot critical path.
+      scheduleIdle(() => {
+        for (const path of IDLE_VIDEO_ASSETS) {
+          preloadVideo(prependBaseUrl(path))
+        }
+      })
     }
   }
 
-  /**
-   * Fire-and-forget background loader for every skin NOT in the critical set.
-   * Safe to call multiple times — concurrent calls share the same in-flight
-   * promise. Callers (e.g. the skin config modal) can `await` the returned
-   * promise if they need to be sure everything's cached before rendering a
-   * gallery.
-   */
-  const preloadRemainingSkins = (): Promise<void> => {
-    if (remainingSkinsPromise) return remainingSkinsPromise
-
-    const remaining: AssetEntry[] = SPINNER_MODEL_IDS
-      .map(id => modelImgPath(id))
-      .filter(src => !resourceCache.images.has(src))
-      .map(src => ({ src, type: 'image' as const }))
-
-    if (remaining.length === 0) {
-      remainingSkinsPromise = Promise.resolve()
-      return remainingSkinsPromise
-    }
-
-    // Smaller chunks than the critical preloader so we don't starve the main
-    // thread / network while the player is already interacting with the arena.
-    remainingSkinsPromise = runInChunks(remaining, 4).catch((e) => {
-      console.error('Background skin preload failed:', e)
-    }) as Promise<void>
-    return remainingSkinsPromise
+  /** Load a set of .ogg voice-over clips on demand; resolves once all are ready. */
+  const preloadVoiceLines = async (paths: string[]): Promise<void> => {
+    const entries: AssetEntry[] = paths
+      .map(p => ({ src: prependBaseUrl(p), type: 'audio' as const }))
+      .filter(e => !resourceCache.audio.has(e.src))
+    if (entries.length === 0) return
+    await runInChunks(entries, 4)
   }
 
   return {
     loadingProgress,
     areAllAssetsLoaded,
     preloadAssets,
-    preloadRemainingSkins,
-    resourceCache // Export this if you want to debug memory usage
+    preloadVoiceLines,
+    resourceCache
   }
 }

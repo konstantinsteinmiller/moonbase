@@ -7,10 +7,21 @@ When creating Vue components in this project, follow these patterns:
 
 1. **Template syntax**: Always use `<template lang="pug">`.
 2. **Styling**: Use `<style scoped lang="sass">` for component styles.
-3. **Tailwind classes in Pug**: Use parenthesized `class=""` attribute for complex classes:
+3. **Tailwind classes in Pug**: Only plain letter/digit/hyphen classes are safe as dot-prefixed pug shortcuts. Anything
+   that contains a character the pug class lexer treats as a terminator/operator MUST go inside the parenthesized
+   `class=""` attribute. Concretely, use `class="…"` for any token containing:
+   - `/` (opacity modifier — e.g. `bg-black/60`, `text-white/70`, `border-white/10`)
+   - `[` or `]` (arbitrary values — e.g. `bg-[#0f1a30]`, `max-w-[300px]`, `text-[11px]`)
+   - `:` (variant prefixes — e.g. `hover:bg-red-500`, `sm:text-base`, `md:grid-cols-2`)
+   - `!` (important override — e.g. `!py-1`)
    ```pug
-   div.flex.items-center(class="gap-2 sm:gap-4 text-sm sm:text-base")
+   // ✅ Correct — breaks parse if written as `.text-white/70.text-sm`
+   p.text-sm.uppercase.tracking-widest(class="text-white/70")
+   // ✅ Correct — arbitrary values and variants belong in class=""
+   div.flex.items-center(class="gap-2 sm:gap-4 bg-[#0f1a30] hover:bg-[#1a2b4b]")
    ```
+   Rule of thumb: if the class name wouldn't be a valid CSS identifier (no slashes, brackets, colons, or bangs), leave
+   it on the dot-shorthand chain. Otherwise, move it into `class="…"`.
 
 4. **Dynamic classes**: Use `:class` with array or object syntax, escape line breaks with `\`:
    ```pug

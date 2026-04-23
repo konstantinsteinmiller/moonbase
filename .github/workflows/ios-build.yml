@@ -179,7 +179,7 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: chaos-arena-ios-${{ inputs.export_method }}
+          name: moonbase-ios-${{ inputs.export_method }}
           path: src-tauri/gen/apple/build/**/*.ipa
           if-no-files-found: error
           retention-days: 14

@@ -1,167 +1,95 @@
 import { onMounted, onUnmounted, ref } from 'vue'
-import useModels from '@/use/useModels'
-import useUser, { isDemo } from '@/use/useUser'
-import useCampaign, { demoCampaignNodes, type MobileNode } from '@/use/useCampaign'
-import useSpinnerCampaign, { STAGES, type ArenaType } from '@/use/useSpinnerCampaign'
-import useLeaderboard from '@/use/useLeaderboard'
-import { arenaType, resetGameStartCount } from '@/use/useSpinnerGame'
-import type { BossAbility } from '@/types/spinner'
-import useSpinnerConfig from '@/use/useSpinnerConfig.ts'
 
-const storedCheat = localStorage.getItem('cheat') || 'false'
+const storedCheat = (() => {
+  try {
+    return localStorage.getItem('cheat') || 'false'
+  } catch {
+    return 'false'
+  }
+})()
 const isCheat = ref<boolean>(JSON.parse(storedCheat))
 
-/** Incremented by cheat shortcut — SpinnerArena watches this to open roulette. */
-export const cheatRouletteSignal = ref(0)
+/** Mission checkpoints the user can jump to. Each represents the world state
+ *  *after* the named mission has completed — phase advanced, inventory set,
+ *  player teleported to a sensible starting spot for the next objective, and
+ *  any in-flight or preceding dialog skipped so nothing flies in mid-warp. */
+export type MissionCheckpoint =
+  | 'flag_done'       // flag posed; heading to quarry
+  | 'quarry_done'     // ore extracted; heading back to base
+  | 'craft_ready'     // back at base with ore; smelt time
+  | 'mission_done'    // everything wrapped
 
+/** Incremented whenever a cheat signal wants to force a scene to react. */
+export const cheatSignals = {
+  skipDialog: ref(0),
+  refillFuel: ref(0),
+  advanceMission: ref(0),
+  teleportToFlag: ref(0),
+  teleportToQuarry: ref(0),
+  teleportToBase: ref(0),
+  toggleNoClip: ref(0),
+  /** Bumps each time a checkpoint cheat fires. Read `checkpoint` for which. */
+  jumpCheckpoint: ref(0),
+  checkpoint: ref<MissionCheckpoint | ''>('')
+}
 
 const useCheats = () => {
   if (!isCheat.value) return {}
-  const { saveCampaign } = useCampaign()
 
-  const { allModels } = useModels()
-  const { setSettingValue } = useUser()
-  const { campaignNodes } = useCampaign()
-
-  /**
-   * ACTIONS
-   */
-  const setSpinnerStage = (stageId: number) => {
-    console.log('stageId: ', stageId)
-    if (stageId < 1 || stageId > STAGES.length) {
-      console.warn(`[CHEAT] Invalid stage ${stageId}. Must be 1-${STAGES.length}.`)
-      return
-    }
-    const { currentStageId } = useSpinnerCampaign()
-    currentStageId.value = stageId
-    localStorage.setItem('spinner_campaign_stage', stageId.toString())
-    console.warn(`[CHEAT] Spinner stage set to ${stageId} (${STAGES[stageId - 1]?.name}).`)
-  }
-
-  const resetChestCooldown = () => {
-    localStorage.setItem('spinner_chest_ready_at', '0')
-    localStorage.setItem('spinner_mini_chest_ready_at', '0')
-    console.warn('[CHEAT] All chest cooldowns reset to 00:00.')
-  }
-
-  const resetGameStartCounter = () => {
-    resetGameStartCount()
-    console.warn('[CHEAT] Game-start counter armed. Next match start will trigger the countdown.')
-  }
-
-  const simulateLeaderboardUpdate = () => {
-    const { forceLeaderboardTick } = useLeaderboard()
-    const { currentStageId } = useSpinnerCampaign()
-    forceLeaderboardTick(currentStageId.value)
-    console.warn('[CHEAT] Leaderboard updated (one hourly tick).')
-  }
-
-  const setArenaType = (type: ArenaType) => {
-    arenaType.value = type
-    console.warn(`[CHEAT] Arena type set to '${type}'.`)
-  }
-
-  /**
-   * Spawn a custom boss-ability test stage scaled to the player's current
-   * upgrade levels. Lets you exercise ghost / split / partners / healers in
-   * isolation without grinding the campaign.
-   */
-  const spawnCheatBoss = (ability: BossAbility) => {
-    const { buildCheatBossStage, loadCheatStage } = useSpinnerCampaign()
-    const stage = buildCheatBossStage(ability)
-    loadCheatStage(stage)
-    console.warn(`[CHEAT] Loaded '${ability}' boss test stage (scaled to your upgrades).`)
-  }
-
-  /** Clear any active cheat-stage override and return to the campaign stage. */
-  const clearCheatStage = () => {
-    const { loadCheatStage } = useSpinnerCampaign()
-    loadCheatStage(null)
-    console.warn('[CHEAT] Cheat stage cleared — back to campaign.')
-  }
-
-  /** Jump forward/backward by 10 stages */
-  const shiftSpinnerStage = (delta: number) => {
-    const { currentStageId } = useSpinnerCampaign()
-    const newStage = Math.max(1, Math.min(STAGES.length, currentStageId.value + delta))
-    setSpinnerStage(newStage)
-  }
-
-  const resetCampaign = () => {
-    setSettingValue('campaign', [])
-    setSettingValue('quest-campaign', false)
-    console.warn('[CHEAT] Campaign progress reset.')
-  }
-  const { addCoins } = useSpinnerConfig()
-
-  /**
-   * CHEAT MAPPING
-   * Define your shortcuts here.
-   * Format: 'ctrl+shift+key' or just 'key'
-   * Note: 'ctrl' also catches 'meta' (Cmd on Mac) for better UX.
-   */
   const cheatsMap: Record<string, () => void> = {
-    'ctrl+shift+j': resetCampaign,
-    'ctrl+shift+d': () => console.log('[DEBUG] Models:', allModels),
-    // Spinner stage shortcuts: Ctrl+Shift+1..9 for stages 1-9, Ctrl+Shift+0 for stage 10
-    'ctrl+shift+1': () => setSpinnerStage(1),
-    'ctrl+shift+2': () => setSpinnerStage(2),
-    'ctrl+shift+3': () => setSpinnerStage(3),
-    'ctrl+shift+4': () => setSpinnerStage(4),
-    'ctrl+shift+5': () => setSpinnerStage(5),
-    'ctrl+shift+6': () => setSpinnerStage(6),
-    'ctrl+shift+7': () => setSpinnerStage(7),
-    'ctrl+shift+8': () => setSpinnerStage(8),
-    'ctrl+shift+o': () => setSpinnerStage(9),
-    'ctrl+shift+p': () => setSpinnerStage(10),
-    'ctrl+shift+alt+1': () => setSpinnerStage(11),
-    'ctrl+shift+alt+2': () => setSpinnerStage(12),
-    'ctrl+shift+alt+3': () => setSpinnerStage(13),
-    'ctrl+shift+alt+4': () => setSpinnerStage(14),
-    'ctrl+shift+alt+5': () => setSpinnerStage(15),
-    'ctrl+shift+alt+6': () => setSpinnerStage(16),
-    'ctrl+shift+alt+7': () => setSpinnerStage(17),
-    'ctrl+shift+alt+8': () => setSpinnerStage(18),
-    'ctrl+shift+alt+9': () => setSpinnerStage(19),
-    'ctrl+shift+alt+0': () => setSpinnerStage(20),
-    'ctrl+shift+alt+t': resetChestCooldown,
-    'ctrl+shift+alt+g': resetGameStartCounter,
-    'ctrl+shift+alt+u': simulateLeaderboardUpdate,
-    // Arena type shortcuts
-    'ctrl+shift+alt+l': () => setArenaType('lava'),
-    'ctrl+shift+alt+i': () => setArenaType('ice'),
-    'ctrl+shift+alt+f': () => setArenaType('forest'),
-    'ctrl+shift+alt+d': () => setArenaType('default'),
-    'ctrl+shift+alt+b': () => setArenaType('boss'),
-    'ctrl+shift+alt+h': () => setArenaType('thunder'),
-    'ctrl+shift+alt+s': () => setArenaType('shock'),
-    // Boss-ability test stages (scaled to player upgrades for a fair fight)
-    'ctrl+shift+alt+q': () => spawnCheatBoss('ghost'),
-    'ctrl+shift+alt+w': () => spawnCheatBoss('split'),
-    'ctrl+shift+alt+e': () => spawnCheatBoss('partners'),
-    'ctrl+shift+alt+r': () => spawnCheatBoss('healers'),
-    'ctrl+shift+alt+z': () => spawnCheatBoss('child-emitter'),
-    'ctrl+shift+alt+x': () => spawnCheatBoss('stat-switch'),
-    'ctrl+shift+alt+v': () => spawnCheatBoss('life-leech'),
-    'ctrl+shift+alt+n': () => spawnCheatBoss('thunder'),
-    'ctrl+shift+alt+m': () => {
-      setSpinnerStage(88)
-      console.warn('[CHEAT] Jumped to stage 88 (sandstorm boss).')
+    'ctrl+shift+s': () => {
+      cheatSignals.skipDialog.value++
+      console.warn('[CHEAT] Skip dialog')
     },
-    'ctrl+shift+alt+k': () => addCoins(3000),
-    'ctrl+shift+alt+c': clearCheatStage,
-    'ctrl+shift+alt+p': () => {
-      cheatRouletteSignal.value++
-      console.warn('[CHEAT] Roulette triggered.')
+    'ctrl+shift+f': () => {
+      cheatSignals.refillFuel.value++
+      console.warn('[CHEAT] Fuel refilled')
     },
+    'ctrl+shift+m': () => {
+      cheatSignals.advanceMission.value++
+      console.warn('[CHEAT] Advance mission')
+    },
+    'ctrl+shift+1': () => {
+      cheatSignals.teleportToFlag.value++
+      console.warn('[CHEAT] Teleport to flag')
+    },
+    'ctrl+shift+2': () => {
+      cheatSignals.teleportToQuarry.value++
+      console.warn('[CHEAT] Teleport to quarry')
+    },
+    'ctrl+shift+3': () => {
+      cheatSignals.teleportToBase.value++
+      console.warn('[CHEAT] Teleport to base')
+    },
+    'ctrl+shift+n': () => {
+      cheatSignals.toggleNoClip.value++
+      console.warn('[CHEAT] Toggle noclip')
+    },
+    // Mission-checkpoint cheats — jump to the state AFTER the named mission
+    // has finished. Each resets voice and inventory so old banter and old
+    // progress from an earlier phase can't leak into the new one.
+    'ctrl+shift+4': () => {
+      cheatSignals.checkpoint.value = 'flag_done'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: flag posing done (→ walk to quarry)')
+    },
+    'ctrl+shift+5': () => {
+      cheatSignals.checkpoint.value = 'quarry_done'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: quarry done (→ return to base)')
+    },
+    'ctrl+shift+6': () => {
+      cheatSignals.checkpoint.value = 'craft_ready'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: back at base (→ smelt ore)')
+    },
+    'ctrl+shift+7': () => {
+      cheatSignals.checkpoint.value = 'mission_done'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: mission complete')
+    }
   }
 
-  /**
-   * EVENT HANDLER
-   * Supports arbitrary multi-key combos (e.g. alt+1+2).
-   * Tracks all currently-held non-modifier keys and matches against cheatsMap
-   * on every keydown. Keys are released on keyup / blur.
-   */
   const heldKeys = new Set<string>()
   const MODIFIER_KEYS = new Set(['control', 'shift', 'alt', 'meta'])
 
@@ -177,7 +105,6 @@ const useCheats = () => {
     if (e.ctrlKey || e.metaKey) parts.push('ctrl')
     if (e.shiftKey) parts.push('shift')
     if (e.altKey) parts.push('alt')
-    // Sort held keys for deterministic order
     const sorted = [...heldKeys].sort()
     parts.push(...sorted)
     return parts.join('+')
@@ -186,9 +113,7 @@ const useCheats = () => {
   const handleKeyDown = (e: KeyboardEvent) => {
     const key = normalizeKey(e)
     if (key) heldKeys.add(key)
-
     const shortcut = buildShortcut(e)
-
     if (cheatsMap[shortcut]) {
       e.preventDefault()
       cheatsMap[shortcut]()
@@ -216,9 +141,7 @@ const useCheats = () => {
     window.removeEventListener('blur', handleBlur)
   })
 
-  return {
-    isCheat
-  }
+  return { isCheat }
 }
 
 export default useCheats

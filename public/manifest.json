@@ -1,6 +1,6 @@
 {
-  "name": "Chaos Arena",
-  "short_name": "Chaos Arena",
+  "name": "Project: Moonbase",
+  "short_name": "Project: Moonbase",
   "display": "standalone",
   "display_override": [
     "fullscreen",
