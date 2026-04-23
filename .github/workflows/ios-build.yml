@@ -1,0 +1,210 @@
+name: iOS Build & Sign
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Xcode export method"
+        required: true
+        default: "app-store-connect"
+        type: choice
+        options:
+          - app-store-connect
+          - release-testing
+          - ad-hoc
+          - debugging
+      upload_testflight:
+        description: "Upload to TestFlight (only valid with app-store-connect)"
+        required: false
+        default: false
+        type: boolean
+      testflight_changelog:
+        description: "Optional changelog for the TestFlight build (What to Test)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build signed IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+      APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}
+      APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}
+      APP_STORE_CONNECT_API_KEY_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_KEY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      FASTLANE_SKIP_UPDATE_CHECK: "1"
+      LC_ALL: en_US.UTF-8
+      LANG: en_US.UTF-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode (16.x — Tauri's Swift libs need swiftCompatibility shims removed in Xcode 26+)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.0"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Ruby + Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: src-tauri
+
+      - name: Initialize Tauri iOS project (first run only)
+        run: |
+          if [ ! -d "src-tauri/gen/apple" ]; then
+            pnpm exec tauri ios init
+          fi
+
+      - name: Install Pillow (for alpha-strip)
+        run: python3 -m pip install --quiet --user --break-system-packages Pillow || python3 -m pip install --quiet --user Pillow
+
+      - name: Pre-strip alpha from master icon (so tauri icon regenerates without transparency)
+        run: |
+          python3 - <<'PY'
+          from PIL import Image
+          path = "src-tauri/icons/icon.png"
+          img = Image.open(path)
+          if img.mode != "RGB":
+              rgba = img.convert("RGBA")
+              bg = Image.new("RGB", img.size, (0, 0, 0))
+              bg.paste(rgba, mask=rgba.split()[3])
+              bg.save(path, "PNG")
+              print(f"Stripped alpha from master: {path}")
+          else:
+              print(f"Master already opaque: {path}")
+          PY
+
+      - name: Sync app icons into iOS asset catalog
+        run: pnpm exec tauri icon src-tauri/icons/icon.png
+
+      - name: Strip alpha from generated iOS icons (defense in depth — App Store rejects 1024x1024 with alpha)
+        run: |
+          python3 - <<'PY'
+          from PIL import Image
+          import glob, os
+
+          patterns = [
+              "src-tauri/icons/ios/*.png",
+              "src-tauri/gen/apple/**/Assets.xcassets/AppIcon.appiconset/*.png",
+          ]
+          paths = []
+          for p in patterns:
+              paths.extend(glob.glob(p, recursive=True))
+          if not paths:
+              print("::warning::No iOS icon PNGs found to strip")
+          for path in paths:
+              img = Image.open(path)
+              if img.mode != "RGB":
+                  rgba = img.convert("RGBA")
+                  bg = Image.new("RGB", img.size, (0, 0, 0))
+                  bg.paste(rgba, mask=rgba.split()[3])
+                  bg.save(path, "PNG")
+                  print(f"Stripped: {path}")
+              else:
+                  print(f"OK: {path}")
+          PY
+
+      - name: Set CFBundleVersion to unique per-run build number
+        run: |
+          BUILD_NUMBER="${{ github.run_number }}"
+          # Tauri's iOS target Info.plist lives at gen/apple/<target>_iOS/Info.plist.
+          # Find it dynamically so we don't hardcode the normalized product name.
+          INFO_PLIST=$(find src-tauri/gen/apple -maxdepth 3 -name Info.plist -not -path '*/build/*' | head -n 1)
+          if [ -z "$INFO_PLIST" ]; then
+            echo "::error::Could not locate iOS Info.plist under src-tauri/gen/apple"
+            find src-tauri/gen/apple -maxdepth 4 -type f -name '*.plist'
+            exit 1
+          fi
+          echo "Patching $INFO_PLIST with CFBundleVersion=$BUILD_NUMBER"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFO_PLIST" \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFO_PLIST"
+
+      - name: Install signing material via match
+        working-directory: src-tauri
+        run: |
+          if [ "${{ inputs.export_method }}" = "ad-hoc" ]; then
+            bundle exec fastlane ios adhoc_certificates
+          else
+            bundle exec fastlane ios certificates
+          fi
+
+      - name: Build signed IPA
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_KEY_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/app_store_connect_api.p8
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "${APP_STORE_CONNECT_API_KEY_KEY}" | base64 --decode > "$APPLE_API_KEY_PATH"
+          pnpm exec tauri ios build --export-method "${{ inputs.export_method }}"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-arena-ios-${{ inputs.export_method }}
+          path: src-tauri/gen/apple/build/**/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Locate built IPA
+        id: findipa
+        if: ${{ inputs.upload_testflight && inputs.export_method == 'app-store-connect' }}
+        run: |
+          IPA_PATH=$(find src-tauri/gen/apple/build -name '*.ipa' | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No .ipa found under src-tauri/gen/apple/build"
+            exit 1
+          fi
+          echo "Found IPA: $IPA_PATH"
+          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_testflight && inputs.export_method == 'app-store-connect' }}
+        working-directory: src-tauri
+        env:
+          IPA_PATH: ${{ github.workspace }}/${{ steps.findipa.outputs.path }}
+          TESTFLIGHT_CHANGELOG: ${{ inputs.testflight_changelog }}
+        run: bundle exec fastlane ios upload_testflight
+
+      - name: Warn if upload requested but export method is wrong
+        if: ${{ inputs.upload_testflight && inputs.export_method != 'app-store-connect' }}
+        run: |
+          echo "::warning::TestFlight upload skipped — export_method '${{ inputs.export_method }}' is not 'app-store-connect'. TestFlight only accepts App Store-signed IPAs."
