@@ -28,10 +28,10 @@ export const isWeb = import.meta.env.VITE_APP_NATIVE !== 'true'
 
 // crazygames/wavedash/itch flags are stubbed false — this build targets
 // desktop web only, but App.vue still imports these names so we keep them.
-export const isCrazyWeb = false
-export const isWaveDash = false
-export const isItch = false
-export const isDemo = false
+export const isCrazyWeb = import.meta.env.VITE_APP_CRAZY_WEB === 'true'
+export const isWaveDash = import.meta.env.VITE_APP_WAVEDASH === 'true'
+export const isItch = import.meta.env.VITE_APP_ITCH === 'true'
+export const isDemo = import.meta.env.VITE_APP_DEMO === 'true'
 
 const readNumber = (key: string, fallback: number) => {
   try {

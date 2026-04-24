@@ -8,10 +8,24 @@ import {
   resolveInitialLocale,
   isSupportedLocale
 } from '@/i18n'
+
+import { isCrazyWeb, isWaveDash, isItch } from '@/use/useUser.ts'
 import { GAME_USER_LANGUAGE } from '@/utils/constants'
 
 const bootstrap = async () => {
   const { default: App } = await import('@/App.vue')
+
+  // Platform SDK init — must happen before App loads.
+  if (isCrazyWeb) {
+    // await initCrazyGames()
+  } else if (isWaveDash) {
+    try {
+      const sdk = await (window as any).WavedashJS
+      if (sdk) await sdk.init({ debug: false })
+    } catch (e) {
+      console.warn('[Wavedash] SDK init failed:', e)
+    }
+  }
 
   const initial = resolveInitialLocale(GAME_USER_LANGUAGE)
   const needsFallback = initial !== 'en'
@@ -37,6 +51,19 @@ const bootstrap = async () => {
   app.use(router)
   app.use(i18n)
   app.mount('#app')
+
+  // Signal to Wavedash that the game is fully loaded and ready
+  if (isWaveDash) {
+    try {
+      const sdk = await (window as any).WavedashJS
+      if (sdk) {
+        sdk.updateLoadProgressZeroToOne?.(1)
+        sdk.readyForEvents?.()
+      }
+    } catch (e) {
+      console.warn('[Wavedash] ready signal failed:', e)
+    }
+  }
 }
 
 bootstrap()

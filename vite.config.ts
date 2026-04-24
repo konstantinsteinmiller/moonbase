@@ -24,7 +24,7 @@ export default defineConfig(({ mode, command }) => {
   const plugins = []
 
   // Only push the obfuscator if both conditions are met
-  if (isProduction && shouldObfuscate) {
+  if (isProduction && shouldObfuscate && false) {
     console.log('--- 🛡️  Obfuscating Production Build ---')
     plugins.push(
       javascriptObfuscator({
