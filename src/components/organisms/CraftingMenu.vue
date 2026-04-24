@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import FButton from '@/components/atoms/FButton.vue'
+import { computed, onUnmounted, ref } from 'vue'
 import FIconButton from '@/components/atoms/FIconButton.vue'
 import useInventory from '@/use/useInventory'
 import useMission from '@/use/useMission'
@@ -37,13 +36,21 @@ const tickSmelt = (now: number) => {
   last = now
   smeltProgress.value += dt / SMELT_DURATION
   if (smeltProgress.value >= 1) {
-    smeltProgress.value = 0
+    // Finished a charge: mint one bar, then either queue the next piece of
+    // ore (consuming it up front so the stats display reflects the charge
+    // currently in the furnace) or stop because the hopper is empty.
     addMetal(1)
-    if (ore.value <= 0) {
+    smeltProgress.value = 0
+    if (ore.value <= 0 || !consumeOre(1)) {
       isSmelting.value = false
       if (phase.value !== 'complete') {
         setPhase('complete')
         showMissionBanner('Mission complete — statue-grade metal ready.', 6000)
+        // Fire the completion dialog. MoonScene's isDialogOpen watcher
+        // flips `complete → explorer_walk` only when a dialog *closes*,
+        // so without this the phase sticks on `complete` and the HUD
+        // marker never re-targets to the next objective.
+        startDialog('mission_complete')
       }
       return
     }
@@ -52,8 +59,11 @@ const tickSmelt = (now: number) => {
 }
 
 const startSmelt = () => {
-  if (!consumeOre(1)) return
   if (isSmelting.value) return
+  // Charge the furnace with the first piece of ore. Subsequent pieces are
+  // consumed by tickSmelt as each bar finishes, so a full hopper melts
+  // down in one press instead of one-per-click.
+  if (!consumeOre(1)) return
   isSmelting.value = true
   last = performance.now()
   smeltProgress.value = 0
@@ -113,19 +123,11 @@ const repairCommsAction = () => {
   close()
 }
 
-const handleKey = (e: KeyboardEvent) => {
-  if (!props.modelValue) return
-  if (e.code === 'Escape' || e.code === 'KeyC') {
-    e.preventDefault()
-    close()
-  }
-}
-
-onMounted(() => window.addEventListener('keydown', handleKey))
-onUnmounted(() => {
-  window.removeEventListener('keydown', handleKey)
-  cancelAnimationFrame(raf)
-})
+// Escape / C toggling is owned by MoonScene's window listener — having a
+// second listener here would fight it: MoonScene opens on C, then this
+// listener saw `modelValue=true` on the SAME keydown and closed again,
+// so the menu never visibly opened.
+onUnmounted(() => cancelAnimationFrame(raf))
 
 const progressPct = computed(() => smeltProgress.value * 100)
 </script>
@@ -135,18 +137,21 @@ const progressPct = computed(() => smeltProgress.value * 100)
     //- NOT a modal — no backdrop click-out, no teleport. Canvas overlay only.
     div.crafting-menu(
       v-if="modelValue"
-      class="fixed right-6 top-24 bottom-24 z-40 w-[360px] max-w-[80vw] rounded-3xl border-4 border-[#0f1a30] bg-[#1a2b4b]/95 shadow-2xl backdrop-blur-sm flex flex-col"
+      class="fixed right-6 top-24 bottom-24 z-40 w-[380px] max-w-[85vw] rounded-3xl border-4 border-[#0f1a30] bg-[#1a2b4b]/95 shadow-2xl backdrop-blur-sm flex flex-col"
     )
       div.header(
-        class="rounded-t-[1.2rem] bg-gradient-to-b from-[#ffcd00] to-[#f7a000] px-4 py-3 flex items-center justify-between border-b-4 border-[#0f1a30]"
+        class="shrink-0 rounded-t-[1.2rem] bg-gradient-to-b from-[#ffcd00] to-[#f7a000] px-4 py-3 flex items-center justify-between border-b-4 border-[#0f1a30]"
       )
         div.title.text-lg.font-black.uppercase.tracking-wider.text-white.brawl-text Smelter
         FIconButton(icon="close" type="danger" size="sm" @click="close")
 
-      div.body.flex-1.p-4.flex.flex-col.gap-4.text-white
-        p.text-sm.leading-relaxed(class="text-white/70")
-          | Feed iron ore to the furnace. Each charge melts into one metal ingot in about three seconds. The world keeps moving — drain your attention wisely.
-        div.stats.grid.grid-cols-2.gap-3
+      //- Body is a min-height-0 flex column so the middle (smelter viz)
+      //- shrinks and scrolls rather than pushing the action buttons off the
+      //- bottom edge when all three command buttons are visible.
+      div.body(class="flex-1 min-h-0 p-4 flex flex-col gap-3 text-white overflow-y-auto")
+        p.text-sm.leading-relaxed.shrink-0(class="text-white/70")
+          | Feed ore to the furnace. Each charge burns for about three seconds and drops one metal bar. The hopper keeps feeding until it runs dry — the world keeps moving while it does, so watch your flanks.
+        div.stats.grid.grid-cols-2.gap-3.shrink-0
           div.stat(class="rounded-lg bg-black/30 border border-white/10 px-3 py-2")
             div(class="text-[10px] uppercase tracking-widest text-white/50") Ore
             div(class="text-2xl font-black text-[#ffcd00]") {{ ore }}
@@ -155,7 +160,7 @@ const progressPct = computed(() => smeltProgress.value * 100)
             div.text-2xl.font-black.text-emerald-300 {{ metal }}
 
         div.smelter(
-          class="relative flex-1 min-h-32 rounded-xl border-2 border-[#0f1a30] bg-gradient-to-b from-[#2a1810] to-[#0d0604] overflow-hidden flex flex-col justify-end"
+          class="relative h-28 shrink-0 rounded-xl border-2 border-[#0f1a30] bg-gradient-to-b from-[#2a1810] to-[#0d0604] overflow-hidden flex flex-col justify-end"
         )
           //- Flame visualization.
           div.flames(
@@ -174,29 +179,41 @@ const progressPct = computed(() => smeltProgress.value * 100)
             template(v-else-if="ore <= 0") Out of ore
             template(v-else) Furnace cold
 
-        div.actions.flex.flex-col.gap-2
-          FButton(
-            type="primary"
-            :is-disabled="!canCraft || ore < 1 || isSmelting"
+        //- Action block is a flex-col and a shrink-0 guard so it never gets
+        //- pushed off the bottom of the panel. Buttons are tappable even on
+        //- narrow panes because each row is its own flex item.
+        div.actions(class="shrink-0 flex flex-col gap-2 mt-auto")
+          button.primary-action(
+            type="button"
+            :disabled="!canCraft || ore < 1 || isSmelting"
+            class="w-full rounded-xl border-2 border-[#0f1a30] bg-gradient-to-b from-[#ffcd00] to-[#f7a000] px-4 py-3 text-center font-black uppercase tracking-wider text-white brawl-text transition-transform hover:brightness-110 active:scale-[0.97] disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed"
             @click="startSmelt"
           )
-            | Smelt 1 Ore
+            template(v-if="isSmelting") Smelting…
+            template(v-else-if="ore > 0") Smelt {{ ore }} Ore
+            template(v-else) Out of Ore
+
           //- Post-meteor repair options — only surfaced while the matching
           //- module is actually broken, so the menu stays clean pre-strike.
-          FButton(
+          button.repair-action(
             v-if="isSolarCellBroken"
-            type="secondary"
-            :is-disabled="!canRepairSolar"
+            type="button"
+            :disabled="!canRepairSolar"
+            class="w-full rounded-xl border-2 border-[#0f1a30] bg-gradient-to-b from-[#50aaff] to-[#2266ff] px-3 py-2 text-left transition-transform hover:brightness-110 active:scale-[0.97] disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed"
             @click="repairSolar"
           )
-            | Repair Solar Cell ({{ SOLAR_METAL_COST }} Metal · {{ SOLAR_PARTS_COST }} Salvage)
-          FButton(
+            div.font-black.uppercase.tracking-wider.text-white.text-sm.brawl-text Repair Solar Cell
+            div(class="text-[11px] uppercase tracking-widest text-white/80") {{ SOLAR_METAL_COST }} Metal · {{ SOLAR_PARTS_COST }} Salvage
+          button.repair-action(
             v-if="isCommsBroken"
-            type="secondary"
-            :is-disabled="!canRepairComms"
+            type="button"
+            :disabled="!canRepairComms"
+            class="w-full rounded-xl border-2 border-[#0f1a30] bg-gradient-to-b from-[#50aaff] to-[#2266ff] px-3 py-2 text-left transition-transform hover:brightness-110 active:scale-[0.97] disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed"
             @click="repairCommsAction"
           )
-            | Repair Comms ({{ COMMS_METAL_COST }} Metal · {{ COMMS_PARTS_COST }} Salvage)
+            div.font-black.uppercase.tracking-wider.text-white.text-sm.brawl-text Repair Comms
+            div(class="text-[11px] uppercase tracking-widest text-white/80") {{ COMMS_METAL_COST }} Metal · {{ COMMS_PARTS_COST }} Salvage
+
           div.hint.text-center.text-xs(class="text-white/50") Press C to close
 </template>
 

@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry.js'
 import { Lensflare, LensflareElement } from 'three/examples/jsm/objects/Lensflare.js'
-import { buildBrokenEwall } from '@/game/EwallRobot'
+import { buildEwall, buildBrokenEwall } from '@/game/EwallRobot'
 
 /**
  * Procedural stylised moon world.
@@ -61,7 +61,18 @@ export type WorldLandmark = {
     | 'refuel-tank' | 'lunar-module'
     | 'broken-ewall-valley' | 'broken-ewall-rift' | 'broken-ewall-quarry'
     | 'explorer-target'
+    | 'cave-entrance'
   position: THREE.Vector3
+}
+
+/** Follow-ending cave door — visual-only (no collider), animated from
+ *  closed → open by MoonScene when the player hits the `[E]` prompt at
+ *  the arch. Exposed here so the scene layer doesn't have to dig the
+ *  mesh out of a userData bag. */
+export interface CaveDoorHandle {
+  mesh: THREE.Mesh
+  closedY: number
+  openY: number
 }
 
 export interface BuildResult {
@@ -72,6 +83,7 @@ export interface BuildResult {
   quarryStones: QuarryStone[]
   airlock: AirlockInstance
   airlockPos: THREE.Vector3
+  caveDoor: CaveDoorHandle | null
   heightAt: (x: number, z: number) => number
 }
 
@@ -755,6 +767,307 @@ const makeRefuelTank = () => {
   return group
 }
 
+/**
+ * Low-poly smelter for the moonbase interior. A squat furnace box with a
+ * glowing fire door, a tapered chimney, and rust-banded accents. Origin is
+ * at the base of the furnace so `group.position.copy(pos)` drops it cleanly
+ * onto the dome floor.
+ *
+ * Returned group exposes `userData.colliderSize` (w, h, d) so the world
+ * builder can emit a matching box collider without hard-coding the numbers
+ * in two places.
+ */
+const makeSmelter = () => {
+  const group = new THREE.Group()
+  const bodyMat = flatMaterial(0x3a3a40, { metalness: 0.5, roughness: 0.6 })
+  const rustMat = flatMaterial(0x8a4a22, { metalness: 0.4, roughness: 0.7 })
+  const steelMat = flatMaterial(0x6a6e76, { metalness: 0.75, roughness: 0.4 })
+  const coalMat = flatMaterial(0x151518, { metalness: 0.2, roughness: 0.9 })
+  // Fire material: emissive so the door glows even with the sun down.
+  const fireMat = new THREE.MeshStandardMaterial({
+    color: 0xff7a1a,
+    emissive: 0xff9030,
+    emissiveIntensity: 1.8,
+    flatShading: true,
+    roughness: 0.5,
+    metalness: 0
+  })
+
+  const BODY_W = 1.8
+  const BODY_H = 1.9
+  const BODY_D = 1.3
+
+  // Main furnace body.
+  const body = new THREE.Mesh(new THREE.BoxGeometry(BODY_W, BODY_H, BODY_D), bodyMat)
+  body.position.y = BODY_H / 2
+  group.add(body)
+
+  // Coal hopper / base skirt — slightly wider platform at the bottom.
+  const skirt = new THREE.Mesh(new THREE.BoxGeometry(BODY_W + 0.25, 0.2, BODY_D + 0.25), coalMat)
+  skirt.position.y = 0.1
+  group.add(skirt)
+
+  // Rust bands around the body (horizontal straps).
+  for (const y of [0.45, 1.35]) {
+    const band = new THREE.Mesh(new THREE.BoxGeometry(BODY_W + 0.03, 0.1, BODY_D + 0.03), rustMat)
+    band.position.y = y
+    group.add(band)
+  }
+
+  // Fire door frame (front face, +z): dark rim around the glowing opening.
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.85, 0.06), coalMat)
+  frame.position.set(0, 0.75, BODY_D / 2 + 0.01)
+  group.add(frame)
+  // Inner glow plate — slightly inset, emissive.
+  const fire = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.65, 0.02), fireMat)
+  fire.position.set(0, 0.75, BODY_D / 2 + 0.05)
+  group.add(fire)
+  // Two horizontal grate bars crossing the glow so the opening reads as a
+  // furnace mouth and not a flat glowing panel.
+  for (const y of [0.55, 0.95]) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.78, 0.06, 0.04), coalMat)
+    bar.position.set(0, y, BODY_D / 2 + 0.07)
+    group.add(bar)
+  }
+
+  // Chimney: a tapered cylinder rising from the top-rear of the body so it
+  // reads as "smokestack" rather than "antenna".
+  const chimney = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.3, 1.4, 10), steelMat)
+  chimney.position.set(0, BODY_H + 0.7, -0.25)
+  group.add(chimney)
+  // Flared cap.
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.22, 0.16, 10), coalMat)
+  cap.position.set(0, BODY_H + 1.48, -0.25)
+  group.add(cap)
+
+  // Top vent housing — a shallow rectangular box flanking the chimney so
+  // the roof doesn't read as a flat lid.
+  const vent = new THREE.Mesh(new THREE.BoxGeometry(BODY_W - 0.2, 0.18, 0.5), steelMat)
+  vent.position.set(0, BODY_H + 0.09, 0.3)
+  group.add(vent)
+
+  // Control valve on the side, purely decorative.
+  const valve = new THREE.Mesh(new THREE.TorusGeometry(0.14, 0.04, 6, 12), rustMat)
+  valve.position.set(BODY_W / 2 + 0.02, 1.0, 0)
+  valve.rotation.y = Math.PI / 2
+  group.add(valve)
+
+  ;(group as any).userData.colliderSize = { w: BODY_W + 0.25, h: BODY_H, d: BODY_D + 0.25 }
+  return group
+}
+
+/** Shared cave-entrance geometry constants. The visual mesh and the matching
+ *  box colliders both read from this record so the rock walls and the
+ *  physics boxes can never drift out of sync — previous versions carved a
+ *  3.5×5 opening but only collided the cliff, letting the player loop around
+ *  the back onto procedural terrain and through the chamber's dark planes.
+ *
+ *  Local frame: `+z` is the approach side (front); `-z` is deeper into the
+ *  cave. Origin sits on the terrain at cavePos. All measurements are in
+ *  metres. Y foundations extend `FOUNDATION` below the visible base so
+ *  walls can't float over low spots in the procedural heightfield. */
+const CAVE = {
+  OPENING_W: 3.2,      // arch clearance at the front
+  OPENING_H: 3.8,
+  OUTER_W: 14,         // total footprint width (side-wall outer to outer)
+  WALL_T: 2,           // side-wall thickness (how much solid rock to each side)
+  ROOF_T: 1.5,         // lintel / ceiling slab thickness
+  FLOOR_THICK: 0.6,    // internal plinth the chamber floor sits on
+  CHAMBER_D: 6,        // how deep the tunnel runs back from the front face
+  BACK_T: 1.5,         // back wall thickness
+  WALL_H: 7,           // total structure height above ground
+  FOUNDATION: 3        // how far colliders extend below ground (terrain drift buffer)
+}
+
+/**
+ * Cave entrance marker for the Ewall-9 "follow" ending. A proper enclosed
+ * rock shell: tall back wall, full side walls, lintel above the arch, and
+ * a narrow opening at the front. The UV-lit arch frames the tunnel mouth
+ * so it reads at distance per the dialog line.
+ *
+ * Colliders are emitted in buildMoonWorld from the same `CAVE` constants,
+ * with a foundation depth so terrain drift under the structure can't leave
+ * a gap at the base.
+ */
+const makeCaveEntrance = () => {
+  const group = new THREE.Group()
+  const rockMat = flatMaterial(0x2e2b28, { metalness: 0.2, roughness: 0.95 })
+  const darkMat = flatMaterial(0x050406, { metalness: 0, roughness: 1 })
+  const uvMat = new THREE.MeshStandardMaterial({
+    color: 0x5a20d8,
+    emissive: 0x8a40ff,
+    emissiveIntensity: 2.2,
+    flatShading: true,
+    roughness: 0.5,
+    metalness: 0
+  })
+
+  const { OPENING_W, OPENING_H, OUTER_W, WALL_T, ROOF_T, CHAMBER_D, BACK_T, WALL_H } = CAVE
+  const halfOpening = OPENING_W / 2
+  const sideW = (OUTER_W - OPENING_W) / 2       // width of each side wall (front slab)
+  const sideX = halfOpening + sideW / 2         // centre of each side-wall slab
+  const totalD = CHAMBER_D + BACK_T              // front-face at z=0, back-face at z=-totalD
+
+  // -- Left + right full-depth side walls. Span the whole structure depth
+  //    so the player can't walk around the sides into the chamber.
+  const sideGeo = new THREE.BoxGeometry(sideW, WALL_H, totalD)
+  const leftWall = new THREE.Mesh(sideGeo, rockMat)
+  leftWall.position.set(-sideX, WALL_H / 2, -totalD / 2)
+  group.add(leftWall)
+  const rightWall = new THREE.Mesh(sideGeo.clone(), rockMat)
+  rightWall.position.set(sideX, WALL_H / 2, -totalD / 2)
+  group.add(rightWall)
+
+  // -- Back wall. Plugs the tunnel at the rear so there's no through-path
+  //    from behind the cave into the chamber.
+  const backWall = new THREE.Mesh(
+    new THREE.BoxGeometry(OPENING_W, WALL_H, BACK_T),
+    rockMat
+  )
+  backWall.position.set(0, WALL_H / 2, -CHAMBER_D - BACK_T / 2)
+  group.add(backWall)
+
+  // -- Lintel above the front arch. Fills the gap between the opening
+  //    ceiling and the structure roof.
+  const lintelH = WALL_H - OPENING_H
+  const lintel = new THREE.Mesh(
+    new THREE.BoxGeometry(OPENING_W, lintelH, ROOF_T),
+    rockMat
+  )
+  lintel.position.set(0, OPENING_H + lintelH / 2, -ROOF_T / 2)
+  group.add(lintel)
+
+  // -- Roof slab covering the entire chamber so the player can't look or
+  //    fall through from above (dome light etc. might otherwise illuminate
+  //    the interior planes from the wrong angle).
+  const roof = new THREE.Mesh(
+    new THREE.BoxGeometry(OUTER_W, ROOF_T, totalD),
+    rockMat
+  )
+  roof.position.set(0, WALL_H - ROOF_T / 2, -totalD / 2)
+  group.add(roof)
+
+  // -- Interior dark liner planes so the tunnel reads as a hollow cavity
+  //    instead of showing the inside faces of the rock boxes. These are
+  //    visual only (no collider) — the walkable floor is the terrain.
+  const interiorD = CHAMBER_D - 0.05
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(OPENING_W, interiorD), darkMat)
+  floor.rotation.x = -Math.PI / 2
+  floor.position.set(0, 0.02, -interiorD / 2 - 0.05)
+  group.add(floor)
+  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(OPENING_W, interiorD), darkMat)
+  ceil.rotation.x = Math.PI / 2
+  ceil.position.set(0, OPENING_H - 0.02, -interiorD / 2 - 0.05)
+  group.add(ceil)
+  const innerBack = new THREE.Mesh(new THREE.PlaneGeometry(OPENING_W, OPENING_H), darkMat)
+  innerBack.position.set(0, OPENING_H / 2, -CHAMBER_D + 0.02)
+  group.add(innerBack)
+  for (const side of [-1, 1]) {
+    const inner = new THREE.Mesh(new THREE.PlaneGeometry(interiorD, OPENING_H), darkMat)
+    inner.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2
+    inner.position.set(side * (halfOpening - 0.02), OPENING_H / 2, -interiorD / 2 - 0.05)
+    group.add(inner)
+  }
+
+  // -- Arched framing at the very front. Decorative half-cylinder that
+  //    softens the rectangular opening into a proper "cave mouth".
+  const archR = halfOpening
+  const archGeo = new THREE.CylinderGeometry(archR, archR, 0.4, 18, 1, true, 0, Math.PI)
+  const arch = new THREE.Mesh(archGeo, darkMat)
+  arch.rotation.z = -Math.PI / 2
+  arch.rotation.y = Math.PI / 2
+  arch.position.set(0, OPENING_H - archR, 0.25)
+  group.add(arch)
+
+  // -- Sliding stone door. Sits in the arch blocking sightline into the
+  //    tunnel; slides straight up into the lintel when the player
+  //    interacts with the entrance (MoonScene animates `position.y`).
+  //    The door has no collider — like the airlock doors, it's purely
+  //    visual. Locking entry is handled by the `[E]` interaction flow.
+  const stoneMat = flatMaterial(0x3f3b36, { metalness: 0.25, roughness: 0.7 })
+  const DOOR_W = OPENING_W - 0.12
+  const DOOR_H = OPENING_H - 0.1
+  const DOOR_T = 0.25
+  const door = new THREE.Mesh(new THREE.BoxGeometry(DOOR_W, DOOR_H, DOOR_T), stoneMat)
+  const doorClosedY = DOOR_H / 2 + 0.05  // bottom sits 5 cm above threshold
+  const doorOpenY = doorClosedY + DOOR_H + 0.1 // slides fully into the lintel
+  door.position.set(0, doorClosedY, 0.08)
+  group.add(door)
+  // UV panel recessed into the front face of the door — lines up with the
+  // surrounding rune set so the closed door reads as "sealed with the
+  // same ultraviolet locking pattern that marks the arch".
+  const doorPanel = new THREE.Mesh(new THREE.BoxGeometry(DOOR_W - 0.8, DOOR_H - 0.8, 0.06), uvMat)
+  doorPanel.position.set(0, 0, DOOR_T / 2 + 0.03)
+  door.add(doorPanel)
+  const doorBar = new THREE.Mesh(new THREE.BoxGeometry(DOOR_W - 0.5, 0.14, 0.05), uvMat)
+  doorBar.position.set(0, -DOOR_H / 2 + 0.25, DOOR_T / 2 + 0.03)
+  door.add(doorBar)
+
+  ;(group as any).userData.door = door
+  ;(group as any).userData.doorClosedY = doorClosedY
+  ;(group as any).userData.doorOpenY = doorOpenY
+
+  // -- Shoulder boulders flanking the entrance — hide the seam between the
+  //    rock face and the terrain so the cliff looks natural.
+  const leftBoulder = new THREE.Mesh(new THREE.DodecahedronGeometry(2.1, 0), rockMat)
+  leftBoulder.position.set(-sideX - sideW / 2 + 0.4, 1.5, 0.3)
+  leftBoulder.rotation.set(0.2, 0.4, 0.1)
+  group.add(leftBoulder)
+  const rightBoulder = new THREE.Mesh(new THREE.DodecahedronGeometry(2.3, 0), rockMat)
+  rightBoulder.position.set(sideX + sideW / 2 - 0.5, 1.6, 0.1)
+  rightBoulder.rotation.set(-0.15, -0.3, 0.05)
+  group.add(rightBoulder)
+
+  // -- UV marker runes — glowing slabs either side of the arch and a
+  //    horizontal slash above so the entrance is visible at range.
+  for (const side of [-1, 1]) {
+    const rune = new THREE.Mesh(new THREE.BoxGeometry(0.18, 1.4, 0.08), uvMat)
+    rune.position.set(side * (halfOpening + 0.3), 1.4, 0.6)
+    group.add(rune)
+    const cap = new THREE.Mesh(new THREE.OctahedronGeometry(0.22, 0), uvMat)
+    cap.position.set(side * (halfOpening + 0.3), 2.3, 0.6)
+    group.add(cap)
+  }
+  const lintelRune = new THREE.Mesh(new THREE.BoxGeometry(OPENING_W - 0.6, 0.12, 0.08), uvMat)
+  lintelRune.position.set(0, OPENING_H + 0.18, 0.6)
+  group.add(lintelRune)
+
+  // -- "The others are a level down." Three Ewall-mate silhouettes lined
+  //    up at the back of the chamber so walking into the cave reveals
+  //    them. Each is the standard buildEwall chassis, colour-shifted so
+  //    they don't look like identical twins of the player. A warm
+  //    emissive campfire between them and the arch gives the back of the
+  //    chamber some colour so they aren't lost in the dark.
+  const mateSpacing = 0.9
+  for (let i = -1; i <= 1; i++) {
+    const mate = buildEwall()
+    mate.chassis.traverse((o: any) => {
+      if (o.isMesh && o.material?.color) {
+        const m = (o.material = o.material.clone())
+        m.color.offsetHSL(0.04 * i, -0.2, 0.05 + 0.04 * i)
+      }
+    })
+    mate.root.position.set(i * mateSpacing, 0, -CHAMBER_D + 1.1)
+    mate.chassis.rotation.y = 0
+    mate.headAnchor.rotation.y = -i * 0.25
+    group.add(mate.root)
+  }
+  const fireMat = new THREE.MeshStandardMaterial({
+    color: 0xff7a1a,
+    emissive: 0xff9040,
+    emissiveIntensity: 2.4,
+    flatShading: true
+  })
+  const fire = new THREE.Mesh(new THREE.IcosahedronGeometry(0.28, 0), fireMat)
+  fire.position.set(0, 0.35, -CHAMBER_D + 2.8)
+  group.add(fire)
+  const fireLight = new THREE.PointLight(0xff9040, 2.2, 8, 2)
+  fireLight.position.copy(fire.position)
+  group.add(fireLight)
+
+  return group
+}
+
 const makeLandingPad = () => {
   const group = new THREE.Group()
   const padMat = flatMaterial(0x4a4f57, { metalness: 0.4, roughness: 0.5 })
@@ -1250,6 +1563,7 @@ export const buildMoonWorld = (): BuildResult => {
   const rand = mulberry32(0x4d30304e)
   const colliders: Collider[] = []
   const landmarks: WorldLandmark[] = []
+  let caveDoor: CaveDoorHandle | null = null
 
   const { mesh: terrain, heightAt, heightField } = makeTerrain(rand)
   root.add(terrain)
@@ -1288,6 +1602,29 @@ export const buildMoonWorld = (): BuildResult => {
   // and a cheap ball approximation would either block the corridor
   // through the cut doorway or swallow the entire habitat. Treating the
   // dome as visual-only keeps the airlock transit unobstructed.
+
+  // Smelter — the physical counterpart of the crafting menu. Sits inside
+  // the dome on the axis the player walks down after clearing the airlock
+  // (they enter from +z and head toward 0), so it's the first thing they
+  // see past the inner door. Rotated to face the entry so the glowing
+  // fire door is visible on approach.
+  const smelterPos = new THREE.Vector3(0, basePos.y, -4)
+  const smelter = makeSmelter()
+  smelter.position.copy(smelterPos)
+  smelter.rotation.y = Math.PI   // fire door faces +z (toward the airlock)
+  root.add(smelter)
+  {
+    const sz = (smelter as any).userData.colliderSize as { w: number; h: number; d: number }
+    colliders.push({
+      kind: 'box',
+      x: smelterPos.x,
+      y: smelterPos.y + sz.h / 2,
+      z: smelterPos.z,
+      w: sz.w,
+      h: sz.h,
+      d: sz.d
+    })
+  }
 
   const airlockInst = makeAirlock()
   // Airlock position: back wall flush with the dome's front face so the
@@ -1513,6 +1850,114 @@ export const buildMoonWorld = (): BuildResult => {
     position: new THREE.Vector3(-70, heightAt(-70, -45), -45)
   })
 
+  // Cave entrance — Ewall-9's refuge, "under the rift". Placed just beyond
+  // the south end of the first rift (40,-75)→(85,-25). The Follow ending
+  // routes the HUD marker here and Ewall-9 drives in this direction after
+  // the player picks that branch.
+  {
+    // Sample terrain across the footprint and elevate the cave to sit
+    // above the highest point — otherwise procedural drift can bring the
+    // heightfield up through the chamber floor and block the tunnel.
+    const cx = 32, cz = -82
+    const yawApprox = Math.atan2(0 - cx, 0 - cz)
+    const cosY = Math.cos(yawApprox), sinY = Math.sin(yawApprox)
+    let peakY = heightAt(cx, cz)
+    for (let lx = -CAVE.OUTER_W / 2; lx <= CAVE.OUTER_W / 2; lx += 2) {
+      for (let lz = -(CAVE.CHAMBER_D + CAVE.BACK_T); lz <= 0.5; lz += 2) {
+        const wx = cx + lx * cosY + lz * sinY
+        const wz = cz - lx * sinY + lz * cosY
+        const h = heightAt(wx, wz)
+        if (h > peakY) peakY = h
+      }
+    }
+    // Sit 0.05 m above the peak so the chamber floor is always above the
+    // terrain heightfield when the player walks in.
+    const cavePos = new THREE.Vector3(cx, peakY + 0.05, cz)
+    const cave = makeCaveEntrance()
+    cave.position.copy(cavePos)
+    cave.rotation.y = yawApprox // face the base
+    root.add(cave)
+    landmarks.push({ kind: 'cave-entrance', position: cavePos.clone() })
+    // Hand the door mesh + target Y values to the scene layer so MoonScene
+    // can animate it in response to the `[E] enter the cave` interaction.
+    caveDoor = {
+      mesh: (cave as any).userData.door,
+      closedY: (cave as any).userData.doorClosedY,
+      openY: (cave as any).userData.doorOpenY
+    }
+    // Emit colliders that mirror the enclosed rock shell built by
+    // makeCaveEntrance. Each slab gets a `FOUNDATION`-deep extension below
+    // the visible base so drift in the procedural heightfield can't leave
+    // a gap the player slips through — and the side walls run the full
+    // structure depth so there's no way to circle around into the chamber.
+    const cy = cavePos.y
+    const rotY = cave.rotation.y
+    const cr = Math.cos(rotY), sr = Math.sin(rotY)
+    const { OPENING_W, OPENING_H, OUTER_W, ROOF_T, CHAMBER_D, BACK_T, WALL_H, FOUNDATION } = CAVE
+    const halfOpening = OPENING_W / 2
+    const sideW = (OUTER_W - OPENING_W) / 2
+    const sideX = halfOpening + sideW / 2
+    const totalD = CHAMBER_D + BACK_T
+    // `grounded` slabs get a FOUNDATION extension DOWN — for walls whose
+    // visible base rests on the terrain, this stops any gap where the
+    // heightfield sags below cavePos.y. Elevated slabs (lintel, roof)
+    // must stay where they are: extending them downward would push their
+    // bottoms into the arch opening and seal it, which is exactly the
+    // "solid wall behind the door" the player was hitting.
+    const pushBox = (
+      lx: number, lyCentre: number, lz: number,
+      w: number, h: number, d: number,
+      grounded = false
+    ) => {
+      const wx = cavePos.x + lx * cr + lz * sr
+      const wz = cavePos.z - lx * sr + lz * cr
+      const boxH = grounded ? h + FOUNDATION : h
+      const centreY = grounded ? lyCentre - FOUNDATION / 2 : lyCentre
+      colliders.push({
+        kind: 'box',
+        x: wx, y: cy + centreY, z: wz,
+        w, h: boxH, d,
+        ry: rotY
+      })
+    }
+    // Full-depth left + right side walls — grounded (start at y=0 and rise
+    // to WALL_H), so foundations are safe.
+    pushBox(-sideX, WALL_H / 2, -totalD / 2, sideW, WALL_H, totalD, true)
+    pushBox(sideX, WALL_H / 2, -totalD / 2, sideW, WALL_H, totalD, true)
+    // Back wall plugging the tunnel — also grounded.
+    pushBox(0, WALL_H / 2, -CHAMBER_D - BACK_T / 2, OPENING_W, WALL_H, BACK_T, true)
+    // Front lintel above the opening. NOT grounded — bottom sits at
+    // y=OPENING_H, foundation here would collapse the archway.
+    const lintelH = WALL_H - OPENING_H
+    pushBox(0, OPENING_H + lintelH / 2, -ROOF_T / 2, OPENING_W, lintelH, ROOF_T)
+    // Roof capping the whole structure. NOT grounded — bottom at y=5.5,
+    // extending it down would pinch the opening from above.
+    pushBox(0, WALL_H - ROOF_T / 2, -totalD / 2, OUTER_W, ROOF_T, totalD)
+
+    // Flat floor plinth inside the chamber — its top sits right at the
+    // visual dark floor so the player transitions smoothly from outside
+    // terrain onto a level platform rather than walking over whatever
+    // bumps the heightfield happens to have under the cave. Uses a
+    // manual push (no `pushSlab` foundation) so the plinth doesn't extend
+    // 3 m UP and create a step the player can't cross into the arch.
+    {
+      const floorH = 0.4
+      const localZ = -CHAMBER_D / 2
+      const fwx = cavePos.x + 0 * cr + localZ * sr
+      const fwz = cavePos.z - 0 * sr + localZ * cr
+      colliders.push({
+        kind: 'box',
+        x: fwx,
+        y: cavePos.y + 0.02 - floorH / 2,  // top flush with visual dark floor
+        z: fwz,
+        w: OPENING_W - 0.1,
+        h: floorH,
+        d: CHAMBER_D - 0.1,
+        ry: rotY
+      })
+    }
+  }
+
   placeBroken('broken-ewall-valley', -42, -70, 0.6, 1)   // inside valley basin
   placeBroken('broken-ewall-rift', 62, -50, -0.8, -1) // midway along rift
   placeBroken('broken-ewall-quarry', -24, 48, 1.4, 1)   // just outside quarry lip
@@ -1726,6 +2171,7 @@ export const buildMoonWorld = (): BuildResult => {
   return {
     root, terrainMesh: terrain, colliders, landmarks, quarryStones,
     airlock: airlockInst, airlockPos: airlockPos.clone(),
+    caveDoor,
     heightAt
   }
 }

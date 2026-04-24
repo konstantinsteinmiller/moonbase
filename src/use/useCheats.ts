@@ -14,10 +14,17 @@ const isCheat = ref<boolean>(JSON.parse(storedCheat))
  *  player teleported to a sensible starting spot for the next objective, and
  *  any in-flight or preceding dialog skipped so nothing flies in mid-warp. */
 export type MissionCheckpoint =
-  | 'flag_done'       // flag posed; heading to quarry
-  | 'quarry_done'     // ore extracted; heading back to base
-  | 'craft_ready'     // back at base with ore; smelt time
-  | 'mission_done'    // everything wrapped
+  | 'flag_done'         // flag posed; heading to quarry
+  | 'quarry_done'       // ore extracted; heading back to base
+  | 'craft_ready'       // back at base with ore; smelt time
+  | 'mission_done'      // Act VI wrapped, explorer briefing queued
+  // Act X+ checkpoints — the second half of the campaign.
+  | 'explorer_ready'    // mission 1 wrapped; head to the valleys
+  | 'post_meteor'       // meteor hit; solar + comms broken, stuck in a valley
+  | 'salvage_ready'     // all 3 broken Ewalls salvaged; walk back to base
+  | 'ewall9_meeting'    // solar repaired; Ewall-9 drives up
+  | 'ending_follow'     // picked "follow"; Ewall-9 heading to the cave
+  | 'ending_repair'     // picked "repair comms"; both modules restored
 
 /** Incremented whenever a cheat signal wants to force a scene to react. */
 export const cheatSignals = {
@@ -87,6 +94,41 @@ const useCheats = () => {
       cheatSignals.checkpoint.value = 'mission_done'
       cheatSignals.jumpCheckpoint.value++
       console.warn('[CHEAT] Checkpoint: mission complete')
+    },
+    // Second-half campaign cheats — ctrl+alt+{digit} so they don't collide
+    // with the ctrl+shift+ block above and the six slots fit under the digit
+    // row for quick testing. Each handler in MoonScene.vue is responsible
+    // for teleporting the player, rehydrating inventory flags, and wiring
+    // any phase-triggered side effects (ewall9 spawn, drive-away, etc.).
+    'ctrl+alt+1': () => {
+      cheatSignals.checkpoint.value = 'explorer_ready'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: explorer briefing (→ head to the valleys)')
+    },
+    'ctrl+alt+2': () => {
+      cheatSignals.checkpoint.value = 'post_meteor'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: post-meteor (modules broken, salvage walk)')
+    },
+    'ctrl+alt+3': () => {
+      cheatSignals.checkpoint.value = 'salvage_ready'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: salvage complete (→ return to base)')
+    },
+    'ctrl+alt+4': () => {
+      cheatSignals.checkpoint.value = 'ewall9_meeting'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: solar repaired (Ewall-9 arrives)')
+    },
+    'ctrl+alt+5': () => {
+      cheatSignals.checkpoint.value = 'ending_follow'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: follow ending (Ewall-9 drives to cave)')
+    },
+    'ctrl+alt+6': () => {
+      cheatSignals.checkpoint.value = 'ending_repair'
+      cheatSignals.jumpCheckpoint.value++
+      console.warn('[CHEAT] Checkpoint: repair ending (comms online)')
     }
   }
 

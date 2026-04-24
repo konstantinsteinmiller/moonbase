@@ -7,7 +7,7 @@ import { createGameLoop } from '@/game/useGameLoop'
 import { buildMoonWorld, WORLD_BOUNDARY, type QuarryStone, type WorldLandmark } from '@/game/MoonWorld'
 import { buildEwall } from '@/game/EwallRobot'
 import { buildFlamethrower } from '@/game/Flamethrower'
-import { buildMeteorShower, type MeteorShowerSystem } from '@/game/MeteorShower'
+import { buildMeteorShower, METEOR_CINEMATIC_TOTAL, type MeteorShowerSystem } from '@/game/MeteorShower'
 import type { MissionPhase } from '@/game/dialog'
 import {
   createPlayerState,
@@ -53,6 +53,7 @@ const {
   tickReminders,
   hasSalvaged,
   markSalvaged,
+  resetSalvaged,
   snapshotSalvaged,
   restoreSalvaged,
   salvagedCount
@@ -70,12 +71,15 @@ const {
   addOre,
   consumeOre,
   addMetal,
+  consumeMetal,
   addParts,
+  consumeParts,
   drainFuel,
   refillFuel,
   hasFuel,
   tickEnergy,
   breakSolarCell,
+  repairSolarCell,
   breakComms,
   repairComms,
   snapshotInventory,
@@ -243,10 +247,13 @@ const stoneBars = ref<{ id: string; x: number; y: number; hp: number }[]>([])
 // -- Meteor strike + cinematic ----------------------------------------------
 // The moment the player enters the exploration target radius, the game
 // takes camera control, spawns the meteor shower, and drives a scripted
-// 4-ish second flyby. `cinematic` gates both the forced camera look-at and
-// the input blackout; `meteor` owns the falling-rock system that outlives
-// the cinematic by a beat while the final stragglers connect.
-const CINEMATIC_TRACK_SECONDS = 4.2
+// flyby whose beats are timed to match the meteor_impact dialog — the rock
+// drifts in slowly while Ewall narrates it, streaks past as Tusk cuts in,
+// and buries Ewall right as Tusk finishes shouting. `cinematic` gates both
+// the forced camera look-at and the input blackout; `meteor` owns the
+// falling-rock system that outlives the cinematic by a beat while the
+// final stragglers connect.
+const CINEMATIC_TRACK_SECONDS = METEOR_CINEMATIC_TOTAL
 const METEOR_TRIGGER_RADIUS = 50
 let meteor: MeteorShowerSystem | null = null
 const cinematic = { active: false, elapsed: 0, ended: false }
@@ -256,10 +263,35 @@ const cinematic = { active: false, elapsed: 0, ended: false }
 // on a heading that turns him toward the player over the first beat of
 // the conversation.
 let ewall9: ReturnType<typeof buildEwall> | null = null
-const ewall9Anim = { walkT: 0, targetYaw: 0, startPos: new THREE.Vector3(), endPos: new THREE.Vector3() }
+// `mode` distinguishes the two scripted tweens: the drive-in that spawns
+// Ewall-9 alongside the player, and the later drive-away when the player
+// picks "follow". Duration is set per-tween so the faster arrival and the
+// longer departure don't have to share a constant.
+const ewall9Anim = {
+  mode: 'idle' as 'idle' | 'arriving' | 'leaving',
+  walkT: 0,
+  duration: 2.8,
+  targetYaw: 0,
+  startPos: new THREE.Vector3(),
+  endPos: new THREE.Vector3()
+}
 
 // Cached explorer-target landmark position; resolved at world build.
 let explorerTarget: THREE.Vector3 | null = null
+
+// Follow-ending arrival latch — flips true the first time the player hits
+// [E] at the cave arch during `ending_followed_ewall9`. Once set, the HUD
+// marker for that phase returns null (objective reached) and the arrival
+// dialog fires. Kept as a ref so targetForPhase picks up the change
+// reactively via `markerScreen` updates.
+const caveArrivalReached = ref(false)
+// Cave door handle + animation state. Damped towards `target` in the
+// fixed step; the mesh's local Y is driven from the damped value so the
+// slab visibly slides up into the lintel when the player opens it.
+let caveDoorMesh: THREE.Mesh | null = null
+const caveDoor = { open: 0, target: 0, closedY: 0, openY: 0 }
+// Radius at which the cave arch shows the interact prompt / accepts E.
+const CAVE_INTERACT_RADIUS = 5
 
 // -- Airlock (pressure chamber) --------------------------------------------
 // Two-door vestibule: the outer "space gate" and the inner "dome gate"
@@ -428,13 +460,66 @@ const spawnEwall9 = () => {
   // him toward the player as he arrives.
   const approachDir = end.clone().sub(start).normalize()
   ewall9.chassis.rotation.y = Math.atan2(-approachDir.x, -approachDir.z)
+  ewall9Anim.mode = 'arriving'
   ewall9Anim.walkT = 0
+  ewall9Anim.duration = 2.8
   ewall9Anim.startPos.copy(start)
   ewall9Anim.endPos.copy(end)
   // Final yaw: face the player. Use the direction from end → player.
   const toPlayer = player.position.clone().sub(end).normalize()
   ewall9Anim.targetYaw = Math.atan2(-toPlayer.x, -toPlayer.z)
   sceneHandle!.scene.add(ewall9.root)
+}
+
+/** Kick off Ewall-9's drive-away tween toward the cave entrance. Runs the
+ *  moment the player picks the "follow" branch so the ending doesn't sit
+ *  on a frozen NPC while the player looks for somewhere to go. After the
+ *  visible tween completes he's teleported to a waiting spot just outside
+ *  the cave — so when the player reaches the UV-lit arch he's still there,
+ *  not despawned into thin air. */
+const ewall9DriveToCave = () => {
+  if (!ewall9) return
+  const cave = L.get('cave-entrance')
+  if (!cave) return
+  const start = ewall9.root.position.clone()
+  // Drive 22 m toward the cave along the bearing — enough visible travel
+  // that the player registers him leaving, then we hand off to the waiting
+  // pose at the cave itself.
+  const dir = cave.clone().sub(start)
+  dir.y = 0
+  const len = dir.length()
+  if (len < 0.01) return
+  dir.divideScalar(len)
+  const end = start.clone().addScaledVector(dir, Math.min(22, len - 2))
+  end.y = heightAtCached(end.x, end.z)
+  ewall9Anim.mode = 'leaving'
+  ewall9Anim.walkT = 0
+  ewall9Anim.duration = 6.5
+  ewall9Anim.startPos.copy(start)
+  ewall9Anim.endPos.copy(end)
+  ewall9Anim.targetYaw = Math.atan2(-dir.x, -dir.z)
+  // Turn immediately in the direction of travel so he doesn't crab
+  // sideways out of the meeting spot.
+  ewall9.chassis.rotation.y = ewall9Anim.targetYaw
+}
+
+/** Teleport Ewall-9 to a waiting spot just outside the cave, facing the
+ *  arch. Called when the drive-away tween completes so the chassis reads
+ *  as "he made it home ahead of you" instead of vanishing mid-regolith. */
+const parkEwall9AtCave = () => {
+  if (!ewall9) return
+  const cave = L.get('cave-entrance')
+  if (!cave) return
+  // Stand him 4 m in front of the arch on the line from origin → cave,
+  // facing the cave so he looks like he's about to step inside. The
+  // player following the marker from the base approaches along the
+  // same line, so Ewall-9 reads as already-there on arrival.
+  const toCave = cave.clone().normalize()
+  const standPos = cave.clone().addScaledVector(toCave, -4)
+  standPos.y = heightAtCached(standPos.x, standPos.z)
+  ewall9.root.position.copy(standPos)
+  ewall9.chassis.rotation.y = Math.atan2(-toCave.x, -toCave.z)
+  ewall9Anim.mode = 'idle'
 }
 
 const destroyStone = (s: LiveStone) => {
@@ -546,6 +631,26 @@ watch(() => currentLine.value?.id, (id) => {
   else if (id === 'end_repair_1') setPhaseUnsafe('ending_comms_repaired')
 })
 
+// Follow-ending hook — when the phase lands on `ending_followed_ewall9`,
+// send Ewall-9 driving toward the cave so the player has a lead to follow
+// and post an explicit guidance banner (the UV arch is visible from the
+// base but small — players reported not knowing where to go). Phase drives
+// this (not the dialog line) so a cheat-warp into the state still fires.
+watch(() => phase.value, (p) => {
+  if (p === 'ending_followed_ewall9') {
+    // Re-arm the arrival latch so a cheat round-trip or phase-replay still
+    // gets the arrival banner + closing dialog the second time through.
+    caveArrivalReached.value = false
+    // Slam the door back shut so the [E] interaction has something to
+    // actually open on a replay — otherwise a prior open state sticks.
+    caveDoor.target = 0
+    caveDoor.open = 0
+    if (caveDoorMesh) caveDoorMesh.position.y = caveDoor.closedY
+    ewall9DriveToCave()
+    showMissionBanner('Follow the UV-lit arch — the rift entrance is marked.', 6500)
+  }
+})
+
 // -- Release the cursor whenever a dialog takes over the UI, and re-lock
 //    onto the canvas the moment it closes so the player drops back into
 //    first-person look without having to click. Crafting menu and pause
@@ -649,6 +754,115 @@ watch(cheatSignals.jumpCheckpoint, () => {
     if (metal.value < 1) addMetal(1)
     setPhase('complete')
     showMissionBanner('CHEAT · mission complete.', 3000)
+  } else if (cp === 'explorer_ready') {
+    // Mission 1 wrapped, explorer briefing delivered. Park at base with the
+    // usual post-smelt inventory and flip straight to explorer_walk so the
+    // HUD marker points at the valleys. Modules are intact — the meteor has
+    // not struck yet.
+    warpToLandmark('moonbase', new THREE.Vector3(0, 0.6, 36))
+    while (ore.value > 0) consumeOre(1)
+    if (metal.value < 3) addMetal(3 - metal.value)
+    resetSalvaged()
+    setPhaseUnsafe('explorer_walk')
+    showMissionBanner('CHEAT · head to the valleys — find a predecessor.', 3000)
+  } else if (cp === 'post_meteor') {
+    // Meteor just cratered. Drop the player a few metres off the explorer
+    // target (close enough that a walkback is trivial but clear of the big
+    // meteor's landing footprint), break both modules, and hand the phase
+    // straight to salvage_walk so the marker points at the first broken
+    // Ewall. No active cinematic — the cheat bypasses that entirely.
+    const ex = L.get('explorer-target')
+    if (ex) {
+      player.position.copy(ex)
+      player.position.z += 6
+      player.position.y = heightAtCached(player.position.x, player.position.z) + 0.6
+      player.forwardVel = 0
+      player.strafeVel = 0
+      player.verticalVel = 0
+      visual.primed = false
+    }
+    while (ore.value > 0) consumeOre(1)
+    if (metal.value < 3) addMetal(3 - metal.value)
+    resetSalvaged()
+    breakSolarCell()
+    breakComms()
+    setPhaseUnsafe('salvage_walk')
+    showMissionBanner('CHEAT · meteor hit — salvage the three predecessors.', 3000)
+  } else if (cp === 'salvage_ready') {
+    // All three chassis stripped. Stand the player on the last salvage spot
+    // (broken-ewall-quarry, per the narrative ordering) with +3 parts and
+    // both modules still broken, then flip to repair_walk for the hike home.
+    const last = L.get('broken-ewall-quarry')
+    if (last) {
+      player.position.copy(last)
+      player.position.y = heightAtCached(last.x, last.z) + 0.6
+      player.forwardVel = 0
+      player.strafeVel = 0
+      player.verticalVel = 0
+      visual.primed = false
+    }
+    while (ore.value > 0) consumeOre(1)
+    if (metal.value < 3) addMetal(3 - metal.value)
+    while (parts.value < 3) addParts(1)
+    breakSolarCell()
+    breakComms()
+    // Mark all three salvaged so the marker re-targets the base.
+    ;(['valley', 'rift', 'quarry'] as const).forEach(markSalvaged)
+    setPhaseUnsafe('repair_walk')
+    showMissionBanner('CHEAT · parts secured — head back to base.', 3000)
+  } else if (cp === 'ewall9_meeting') {
+    // Solar fixed via the crafting menu, comms still down, salvage-derived
+    // parts spent on the solar repair (2 parts). Land the player just
+    // outside the airlock facing away from the dome so the ewall9 drive-in
+    // has open ground to roll across instead of clipping through glass.
+    warpToLandmark('moonbase', new THREE.Vector3(0, 0.6, 36))
+    player.yaw = 0 // look outward — ewall9 spawns to the player's right
+    while (ore.value > 0) consumeOre(1)
+    if (metal.value < 2) addMetal(2 - metal.value)
+    // 1 part left after the solar repair (cost was 2 of 3).
+    while (parts.value > 1) consumeParts(1)
+    while (parts.value < 1) addParts(1)
+    ;
+    (['valley', 'rift', 'quarry'] as const).forEach(markSalvaged)
+    repairSolarCell()
+    breakComms()
+    // Setting the phase fires the spawnEwall9 watcher — no need to call it
+    // directly. Safe even if ewall9 already exists; spawnEwall9 is idempotent.
+    setPhaseUnsafe('ewall9_meeting')
+    showMissionBanner('CHEAT · solar online — Ewall-9 inbound.', 3000)
+  } else if (cp === 'ending_follow') {
+    // Player picked "follow". Stand them at the meeting spot with the same
+    // inventory they'd have post-solar-repair (1 metal + 2 parts spent, so
+    // 2 metal + 1 part left), ensure the ewall9 chassis exists, then flip
+    // the phase — the watcher kicks off ewall9DriveToCave so he rolls off
+    // toward the UV-lit rift entrance and the HUD marker re-targets.
+    warpToLandmark('moonbase', new THREE.Vector3(0, 0.6, 36))
+    player.yaw = 0
+    while (ore.value > 0) consumeOre(1)
+    while (metal.value > 2) consumeMetal(1)
+    while (metal.value < 2) addMetal(1)
+    while (parts.value > 1) consumeParts(1)
+    while (parts.value < 1) addParts(1)
+    repairSolarCell()
+    breakComms()
+    ;(['valley', 'rift', 'quarry'] as const).forEach(markSalvaged)
+    spawnEwall9()
+    setPhaseUnsafe('ending_followed_ewall9')
+    showMissionBanner('CHEAT · follow ending — chase Ewall-9 to the cave.', 3000)
+  } else if (cp === 'ending_repair') {
+    // Player picked "repair comms". Both modules restored (solar: 1 metal +
+    // 2 parts; comms: 1 metal + 1 part), leaving 1 metal + 0 parts. Park at
+    // base — terminal phase, no further mission progression after.
+    warpToLandmark('moonbase', new THREE.Vector3(2, 0.6, 0))
+    while (ore.value > 0) consumeOre(1)
+    while (metal.value > 1) consumeMetal(1)
+    while (metal.value < 1) addMetal(1)
+    while (parts.value > 0) consumeParts(1)
+    repairSolarCell()
+    repairComms()
+    ;(['valley', 'rift', 'quarry'] as const).forEach(markSalvaged)
+    setPhaseUnsafe('ending_comms_repaired')
+    showMissionBanner('CHEAT · repair ending — comms online.', 3000)
   }
   cheatSignals.checkpoint.value = ''
 })
@@ -686,6 +900,15 @@ onMounted(async () => {
   airlock.innerDoorZ = world.airlockPos.z + world.airlock.innerDoorZLocal
   airlock.outerOpen = 0
   airlock.innerOpen = 0
+  // Cache the cave door handle so the fixed step can slide it open when
+  // the player hits [E] at the arch during the Follow ending.
+  if (world.caveDoor) {
+    caveDoorMesh = world.caveDoor.mesh
+    caveDoor.closedY = world.caveDoor.closedY
+    caveDoor.openY = world.caveDoor.openY
+    caveDoor.open = 0
+    caveDoor.target = 0
+  }
 
   // Sun position overrides directional light target.
   const sun = (world.root as any).userData.sun as THREE.Object3D | undefined
@@ -984,6 +1207,16 @@ onMounted(async () => {
         setPhase('flag_walk')
       }
 
+      // Cave door animation — damp `open` toward `target` and drive the
+      // slab's local Y off the result. The mesh itself lives in the cave
+      // group, which is rotated/translated to cavePos; we only touch
+      // position.y, so the slide reads along the door's local "up" axis.
+      if (caveDoorMesh) {
+        caveDoor.open = damp(caveDoor.open, caveDoor.target, 4, dt)
+        caveDoorMesh.position.y = caveDoor.closedY
+          + (caveDoor.openY - caveDoor.closedY) * caveDoor.open
+      }
+
       // Meteor strike trigger: explorer phase + within 50 m of the target.
       // Fires once — the cinematic flips the phase to `meteor_impact` which
       // no longer matches this guard. `explorerTarget` is cached at world
@@ -1128,9 +1361,16 @@ onMounted(async () => {
 
       // Contextual interact prompt. Multiple sources compose into the same
       // HUD slot — refuel while at the tank, salvage while next to a
-      // broken Ewall. Salvage takes precedence because both prompts can
-      // theoretically coincide near the quarry chassis.
+      // broken Ewall, cave door during the Follow ending. Salvage takes
+      // precedence because both prompts can theoretically coincide near
+      // the quarry chassis.
       const refuelPos = L.get('refuel-tank')
+      const cavePos = L.get('cave-entrance')
+      const caveInteractable =
+        phase.value === 'ending_followed_ewall9'
+        && !caveArrivalReached.value
+        && cavePos
+        && cavePos.distanceTo(player.position) < CAVE_INTERACT_RADIUS
       if (
         nearestSalvage
         && !isDialogOpen.value
@@ -1138,6 +1378,13 @@ onMounted(async () => {
         && !isCraftingOpen.value
       ) {
         interactPrompt.value = '[E] to salvage parts'
+      } else if (
+        caveInteractable
+        && !isDialogOpen.value
+        && !isPauseMenuOpen.value
+        && !isCraftingOpen.value
+      ) {
+        interactPrompt.value = '[E] enter the cave'
       } else if (refuelPos
         && refuelPos.distanceTo(player.position) < 4
         && fuel.value < 0.999
@@ -1200,19 +1447,31 @@ onMounted(async () => {
         }
       }
 
-      // Ewall-9 drive-in: linear interpolate along start→end while he
-      // rotates to face the player. Only runs once, then freezes him at
-      // the approach endpoint for the rest of the conversation.
-      if (ewall9 && ewall9Anim.walkT < 1) {
-        ewall9Anim.walkT = Math.min(1, ewall9Anim.walkT + dt / 2.8)
+      // Ewall-9 tween: shared loop for both the arrival and the cave-bound
+      // departure. Lerps along start→end and blends the chassis yaw toward
+      // the stored target. When the departure tween completes we despawn
+      // the chassis so the ending doesn't leave a statue frozen mid-rift.
+      if (ewall9 && ewall9Anim.mode !== 'idle' && ewall9Anim.walkT < 1) {
+        ewall9Anim.walkT = Math.min(1, ewall9Anim.walkT + dt / ewall9Anim.duration)
         const t = ewall9Anim.walkT
         ewall9.root.position.lerpVectors(ewall9Anim.startPos, ewall9Anim.endPos, t)
-        // Turn toward the player only during the last third of the
-        // approach — before that he's still driving forward.
-        if (t > 0.6) {
-          const blend = (t - 0.6) / 0.4
-          const currentYaw = ewall9.chassis.rotation.y
-          ewall9.chassis.rotation.y = currentYaw + (ewall9Anim.targetYaw - currentYaw) * blend * 0.2
+        if (ewall9Anim.mode === 'arriving') {
+          // Turn toward the player only during the last third of the
+          // approach — before that he's still driving forward.
+          if (t > 0.6) {
+            const blend = (t - 0.6) / 0.4
+            const currentYaw = ewall9.chassis.rotation.y
+            ewall9.chassis.rotation.y = currentYaw + (ewall9Anim.targetYaw - currentYaw) * blend * 0.2
+          }
+          if (t >= 1) ewall9Anim.mode = 'idle'
+        } else if (ewall9Anim.mode === 'leaving') {
+          // Already oriented along the travel bearing at tween start, so
+          // no per-frame yaw blending needed — just let him roll out.
+          if (t >= 1) {
+            // Don't despawn — teleport to the waiting spot outside the
+            // cave so the player finds him there when they arrive.
+            parkEwall9AtCave()
+          }
         }
       }
 
@@ -1483,6 +1742,81 @@ onMounted(async () => {
         inv.repairSolarCell()
         setPhaseUnsafe('ewall9_meeting')
         startDialogDirect('mission_solar_repaired', true)
+      },
+
+      // -- Follow-ending inspection + shortcuts ---------------------------
+      /** World position of the UV-lit cave entrance landmark. */
+      get caveEntrancePos() {
+        const p = L.get('cave-entrance')
+        return p ? { x: p.x, y: p.y, z: p.z } : null
+      },
+      /** Terrain height samples around the cave arch — used by the
+       *  Follow-ending test to diagnose blocking at the threshold. */
+      caveAreaHeights: () => {
+        const p = L.get('cave-entrance')
+        if (!p) return null
+        const samples: Record<string, number> = {}
+        for (const dz of [-2, -1, 0, 1, 2, 3]) {
+          const hx = p.x - dz * Math.sin(Math.atan2(-p.x, -p.z))
+          const hz = p.z - dz * Math.cos(Math.atan2(-p.x, -p.z))
+          samples[`z_${dz}`] = heightAtCached(hx, hz)
+        }
+        samples['cavePosY'] = p.y
+        return samples
+      },
+      /** Current damped open state of the cave's stone door (0 = closed,
+       *  1 = fully slid up into the lintel). Tests poll this after hitting
+       *  [E] to confirm the door actually animated open. */
+      get caveDoorOpen() {
+        return caveDoor.open
+      },
+      /** Debug: live forward velocity + yaw + pressed-forward flag, used
+       *  by the Follow-ending test to diagnose why the walk-through hop
+       *  didn't make it as deep as expected. */
+      get motion() {
+        return {
+          forwardVel: player?.forwardVel ?? 0,
+          strafeVel: player?.strafeVel ?? 0,
+          yaw: player?.yaw ?? 0,
+          pressedForward: (pressed as any).forward,
+          speedMod: speedMod
+        }
+      },
+      /** Latch: has the player crossed the arch threshold during the
+       *  Follow ending. HUD marker drops to null once this is true. */
+      get caveArrivalReached() {
+        return caveArrivalReached.value
+      },
+      /** Current `[E]` prompt text surfaced by the HUD. `null` means the
+       *  player isn't within range of any interactable. */
+      get interactPromptText() {
+        return interactPrompt.value
+      },
+      /** Fire the Follow-ending "open the cave door" flow directly — same
+       *  effect as an [E] press inside the interact radius, but without
+       *  depending on keyboard focus / proximity. Used by the follow-
+       *  ending test to deterministically drive the ending. */
+      triggerCaveEntry: () => {
+        if (phase.value !== 'ending_followed_ewall9') return false
+        if (caveArrivalReached.value) return false
+        caveArrivalReached.value = true
+        caveDoor.target = 1
+        if (!isDialogOpen.value) startDialog('mission_cave_arrival')
+        showMissionBanner('Orders rewritten. You walked off the server.', 6000)
+        return true
+      },
+      /** Skip the entire pre-ending setup: repair solar, drive the Ewall-9
+       *  dialog to the `follow` choice, and land on `ending_followed_ewall9`
+       *  without walking the full post-meteor arc. Used by the follow-
+       *  ending test. */
+      jumpToFollowEnding: () => {
+        // Give the tester everything the normal flow would have granted.
+        if (parts.value < 3) addParts(3 - parts.value)
+        if (metal.value < 3) addMetal(3 - metal.value)
+        repairSolarCell()
+        breakComms()
+        ;(['valley', 'rift', 'quarry'] as const).forEach(markSalvaged)
+        setPhaseUnsafe('ending_followed_ewall9')
       }
     }
   }
@@ -1529,6 +1863,16 @@ const targetForPhase = (p: typeof phase.value): THREE.Vector3 | null => {
       return L.get('moonbase') ?? null
     }
     case 'repair_walk': return L.get('moonbase') ?? null
+    // Endings — "follow" routes the yellow marker to the UV-lit cave
+    // entrance; "comms repaired" has no lingering objective because the
+    // mission is already closed, but pointing the marker at the base keeps
+    // the HUD from flashing a blank.
+    case 'ending_followed_ewall9':
+      // Once the player has crossed the threshold the objective is done,
+      // so drop the HUD marker rather than keeping it painted on his back.
+      return caveArrivalReached.value ? null : (L.get('cave-entrance') ?? null)
+    case 'ending_comms_repaired':
+      return L.get('moonbase') ?? null
     default: return null
   }
 }
@@ -1565,6 +1909,23 @@ const onKeyDown = (e: KeyboardEvent) => {
                          'mission_salvage_quarry'
       startDialog(dialogId)
       nearestSalvage = null
+      e.preventDefault()
+      return
+    }
+    // Cave entrance — during the Follow ending, E at the arch slides the
+    // stone door up into the lintel, fires the closing dialog, drops the
+    // HUD marker, and latches the arrival so the prompt goes away.
+    const cavePosKey = L.get('cave-entrance')
+    if (
+      phase.value === 'ending_followed_ewall9'
+      && !caveArrivalReached.value
+      && cavePosKey
+      && cavePosKey.distanceTo(player.position) < CAVE_INTERACT_RADIUS
+    ) {
+      caveArrivalReached.value = true
+      caveDoor.target = 1
+      if (!isDialogOpen.value) startDialog('mission_cave_arrival')
+      showMissionBanner('Orders rewritten. You walked off the server.', 6000)
       e.preventDefault()
       return
     }

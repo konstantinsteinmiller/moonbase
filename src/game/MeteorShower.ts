@@ -33,6 +33,20 @@ const SMALL_ROCK_COUNT = 24
 const HIT_RADIUS = 1.1               // horizontal radius that counts as "hit Ewall"
 const GRAVITY = 9.81
 
+// Cinematic timing — chosen so the visuals track the dialog beats:
+//   0 s   Ewall: "my visor is tilting upward…"        (line 1, ~5 s)
+//   5 s   Ewall: "oh that is very large…"             (line 2, ~6 s)
+//  11 s   Tusk:  "…move. Ewall. MOVE."                (line 3, ~6.5 s)
+//  17 s   Ewall: "I cannot move…"                     (line 4)
+//
+// The big meteor drifts in very slowly for APPROACH_TIME so the player sees
+// it grow while Ewall narrates it. Once Tusk starts shouting, the meteor
+// streaks past (STREAK_TIME) and the small-rock shower begins, pinning Ewall
+// right as Tusk finishes. Total cinematic ≈ APPROACH_TIME + STREAK_TIME.
+const APPROACH_TIME = 11
+const STREAK_TIME = 4.2
+export const METEOR_CINEMATIC_TOTAL = APPROACH_TIME + STREAK_TIME
+
 export interface MeteorShowerSystem {
   root: THREE.Object3D
   /** Call once per render frame. Returns `true` while the shower is still
@@ -92,12 +106,15 @@ export const buildMeteorShower = (
 ): MeteorShowerSystem => {
   const root = new THREE.Group()
 
-  // --- Big meteor (miss trajectory) ---------------------------------------
-  // Place it ~120 m up and 80 m to Ewall's upper-left; launch it on a
-  // shallow arc that passes a comfortable 35 m to Ewall's side and carries
-  // on for a further 160 m before impact. Mass + dynamic body could be
-  // done with Rapier, but for a 4 s cinematic a scripted ballistic is
-  // cheaper and gives us deterministic camera framing.
+  // --- Big meteor (two-phase trajectory) ----------------------------------
+  // Phase 1 (APPROACH_TIME s): the meteor creeps in from deep space toward a
+  // streak-start position high above Ewall's upper-left. Slow linear glide,
+  // no gravity — the point is to give the player time to see it grow while
+  // the opening dialog lines play.
+  //
+  // Phase 2 (STREAK_TIME s): the familiar ballistic miss. Starting from the
+  // streak-start position, the meteor arcs past Ewall and craters 100 m past
+  // him. Kicks off right as Tusk starts shouting "MOVE".
   const bigGeo = new THREE.IcosahedronGeometry(BIG_METEOR_RADIUS, 1)
   const bigMat = new THREE.MeshStandardMaterial({
     color: 0x22201c, roughness: 0.95, flatShading: true,
@@ -108,12 +125,20 @@ export const buildMeteorShower = (
   // looking along -forward, so offset = -right for "to the left".
   const forward = new THREE.Vector3(-Math.sin(ewallYaw), 0, -Math.cos(ewallYaw))
   const right = new THREE.Vector3(Math.cos(ewallYaw), 0, -Math.sin(ewallYaw))
-  const startOffset = new THREE.Vector3()
+  // Streak-start: tuned so the subsequent 4.2 s ballistic feels tight.
+  const streakStartOffset = new THREE.Vector3()
     .addScaledVector(right, -60)   // 60 m to Ewall's left
-    .addScaledVector(forward, 80) // 80 m ahead (so it streaks past in view)
-  startOffset.y = 120
-  const bigStart = ewallPos.clone().add(startOffset)
-  bigMesh.position.copy(bigStart)
+    .addScaledVector(forward, 80)  // 80 m ahead (so it streaks past in view)
+  streakStartOffset.y = 120
+  const streakStart = ewallPos.clone().add(streakStartOffset)
+  // Approach-start: ~4× further along the same bearing, ~3.5× higher. From
+  // the player's perspective the meteor is a bright pinprick at t=0 and
+  // swells into a visible rock by the time Tusk cuts in.
+  const approachStart = ewallPos.clone()
+    .addScaledVector(right, -240)
+    .addScaledVector(forward, 320)
+  approachStart.y = 420
+  bigMesh.position.copy(approachStart)
   root.add(bigMesh)
 
   // Trail: a stretched additive sprite-ish trail made from a flat elongated
@@ -131,23 +156,31 @@ export const buildMeteorShower = (
   const trail = new THREE.Mesh(trailGeo, trailMat)
   bigMesh.add(trail)
 
-  // Aim at a ground point 160 m past Ewall (miss distance ~35 m to the side)
+  // Aim at a ground point 100 m past Ewall (miss distance ~35 m to the side).
   const bigLandingSide = new THREE.Vector3()
     .addScaledVector(right, 35)
     .addScaledVector(forward, 100)
   const bigLanding = ewallPos.clone().add(bigLandingSide)
   bigLanding.y = heightAt(bigLanding.x, bigLanding.z)
 
-  // Solve: travel time to reach landing point under constant gravity.
-  const BIG_TIME = 4.2  // seconds for the flyby (cinematic duration)
-  const dxBig = bigLanding.x - bigStart.x
-  const dzBig = bigLanding.z - bigStart.z
-  const dyBig = bigLanding.y - bigStart.y
-  const bigVel = new THREE.Vector3(
-    dxBig / BIG_TIME,
-    dyBig / BIG_TIME + 0.5 * GRAVITY * BIG_TIME,
-    dzBig / BIG_TIME
+  // Solve the streak phase: travel time from streakStart → bigLanding under
+  // gravity so the arc lands exactly as STREAK_TIME expires.
+  const dxBig = bigLanding.x - streakStart.x
+  const dzBig = bigLanding.z - streakStart.z
+  const dyBig = bigLanding.y - streakStart.y
+  // Streak velocity is set when phase 1 ends, but the linear approach
+  // velocity is needed immediately so the meteor doesn't hang motionless.
+  const approachVel = streakStart.clone().sub(approachStart).divideScalar(APPROACH_TIME)
+  const streakVel = new THREE.Vector3(
+    dxBig / STREAK_TIME,
+    dyBig / STREAK_TIME + 0.5 * GRAVITY * STREAK_TIME,
+    dzBig / STREAK_TIME
   )
+  // `bigVel` is swapped between the two vectors at the phase boundary so the
+  // integration block below stays untouched. Gravity is applied only during
+  // the streak phase — tracked via `bigPhase`.
+  const bigVel = approachVel.clone()
+  let bigPhase: 'approach' | 'streak' = 'approach'
   let bigAlive = true
   let bigT = 0
 
@@ -184,25 +217,39 @@ export const buildMeteorShower = (
       mesh: m,
       vel: new THREE.Vector3(vx, vy, vz),
       alive: true,
-      // Stagger spawns across the cinematic so rocks don't all hit together.
-      // The flyby lasts ~4 s; rocks start dropping at 1.2 s and trail off
-      // over a further ~2.5 s.
-      delay: 1.2 + Math.random() * 2.5
+      // Held back through the full approach so the first rocks start falling
+      // exactly when Tusk cuts in at t = APPROACH_TIME, then stagger across
+      // ~2.5 s so the impacts overlap the "MOVE. Ewall. MOVE." beat rather
+      // than a single all-at-once shower.
+      delay: APPROACH_TIME + Math.random() * 2.5
     })
     m.visible = false
   }
 
-  playFlyby()
+  // No flyby SFX yet — the rock is still a speck in deep space. The loud
+  // whoosh is played at the phase boundary when it actually streaks past.
 
   let impactCount = 0
   let hitEwallThisFrame = false
 
   const update = (dt: number, playerPos: THREE.Vector3): boolean => {
     hitEwallThisFrame = false
-    // Big meteor integration.
+    // Big meteor integration — two phases share this block by swapping the
+    // velocity vector and gating gravity on `bigPhase`.
     if (bigAlive) {
       bigT += dt
-      bigVel.y -= GRAVITY * dt
+      if (bigPhase === 'approach' && bigT >= APPROACH_TIME) {
+        // Hand off to the streak arc. Snap the meteor to the streak-start
+        // pivot so small floating-point drift from the linear glide doesn't
+        // shift the ballistic impact point.
+        bigMesh.position.copy(streakStart)
+        bigVel.copy(streakVel)
+        bigPhase = 'streak'
+        // Re-play the flyby SFX at phase boundary — the first play covered
+        // the deep-space approach; this one covers the loud streak past.
+        playFlyby()
+      }
+      if (bigPhase === 'streak') bigVel.y -= GRAVITY * dt
       bigMesh.position.addScaledVector(bigVel, dt)
       // Orient trail along velocity (cylinder local-Y is up; rotate to align
       // with velocity direction).
@@ -212,7 +259,10 @@ export const buildMeteorShower = (
       if (axis.lengthSq() > 1e-6) {
         trail.quaternion.setFromAxisAngle(axis.normalize(), angle)
       }
-      if (bigT > BIG_TIME + 0.5 || bigMesh.position.y < heightAt(bigMesh.position.x, bigMesh.position.z)) {
+      const timedOut = bigT > APPROACH_TIME + STREAK_TIME + 0.5
+      const cratered = bigPhase === 'streak'
+        && bigMesh.position.y < heightAt(bigMesh.position.x, bigMesh.position.z)
+      if (timedOut || cratered) {
         bigAlive = false
         bigMesh.visible = false
         // Fired once when the big one craters — loudest impact in the bank.

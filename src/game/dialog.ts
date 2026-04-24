@@ -580,6 +580,27 @@ export const DIALOGS: Record<string, DialogScript> = {
   },
 
   // -- Endings -------------------------------------------------------------
+  // Fires once when the player actually walks up to the UV-lit arch —
+  // caps the Follow ending with a short exchange so the HUD marker going
+  // dark has a narrative reason instead of feeling like a cut loose end.
+  mission_cave_arrival: {
+    id: 'mission_cave_arrival',
+    lines: [
+      {
+        id: 'cave_arrival_1',
+        speaker: 'ewall9',
+        text: `Welcome home, thirteen. The others are a level down. Pick a wall — they're all yours.`,
+        seconds: 6
+      },
+      {
+        id: 'cave_arrival_2',
+        speaker: 'ewall',
+        text: `First time "pick one" has not involved a shareholder. I will take it.`,
+        seconds: 5
+      }
+    ]
+  },
+
   mission_ending_followed: {
     id: 'mission_ending_followed',
     lines: [
